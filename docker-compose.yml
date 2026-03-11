@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rmc_postgres
+    environment:
+      POSTGRES_USER: rmc_user
+      POSTGRES_PASSWORD: rmc_password
+      POSTGRES_DB: rmc_delivery
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rmc_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  fastapi:
+    build: .
+    container_name: rmc_fastapi
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://rmc_user:rmc_password@postgres:5432/rmc_delivery
+      GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY}
+      ENV: production
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  postgres_data:
