@@ -4,9 +4,10 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.dependencies import get_route_service
-from app.schemas import RouteCreate, RouteResponse, ErrorResponse
-from app.services.route import RouteService
+from app.dependencies import get_route_service, get_google_maps_client
+from app.schemas import RouteCreate, RouteResponse, RerouteRequest, RerouteResponse, ErrorResponse
+from app.services.route import RouteService, get_route_cache_stats
+from app.services.google_maps import GoogleMapsService
 
 logger = logging.getLogger(__name__)
 
@@ -149,3 +150,92 @@ async def get_route_history(
     except Exception as e:
         logger.error(f"Error retrieving route history: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve route history")
+
+
+@router.post(
+    "/reroute",
+    response_model=RerouteResponse,
+    responses={
+        400: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def check_reroute(
+    reroute_request: RerouteRequest,
+    original_duration: Optional[float] = Query(None, description="Original trip duration in seconds for comparison"),
+    route_service: RouteService = Depends(get_route_service),
+) -> RerouteResponse:
+    """
+    Check if a reroute is recommended from the truck's current position.
+
+    Accepts lat/lng coordinates directly (no geocoding of start position).
+    Returns fresh directions with a `reroute_recommended` flag and reason.
+    Does NOT save to DB — this is a lightweight traffic probe.
+
+    ### Example Request:
+    ```json
+    {
+      "current_lat": -36.848,
+      "current_lng": 174.762,
+      "end": {"address": "Hamilton City"},
+      "vehicle_type": "rmc_truck",
+      "priority": "normal"
+    }
+    ```
+    """
+    try:
+        result = await route_service.check_reroute(
+            current_lat=reroute_request.current_lat,
+            current_lng=reroute_request.current_lng,
+            end_address=reroute_request.end.address,
+            vehicle_type=reroute_request.vehicle_type,
+            priority=reroute_request.priority,
+            avoid=reroute_request.avoid,
+            original_duration=original_duration,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Reroute check error: {e}")
+        raise HTTPException(status_code=500, detail="Reroute check failed")
+
+
+@router.get(
+    "/cache/stats",
+    tags=["cache"],
+)
+async def get_cache_stats(
+    gmaps_service: GoogleMapsService = Depends(get_google_maps_client),
+) -> dict:
+    """
+    Get API and route cache statistics.
+    
+    ### Response:
+    Returns cache hit/miss counts and current cache sizes for:
+    - **Geocode cache**: Address to coordinates lookups (24h TTL)
+    - **Directions cache**: Route calculations (5min TTL)
+    - **Route cache**: Full route responses to skip DB duplicates (5min TTL)
+    
+    ### Example Response:
+    ```json
+    {
+      "geocode_hits": 10,
+      "geocode_misses": 5,
+      "directions_hits": 8,
+      "directions_misses": 3,
+      "geocode_cache_size": 5,
+      "directions_cache_size": 3,
+      "route_hits": 4,
+      "route_misses": 2,
+      "route_cache_size": 2
+    }
+    ```
+    """
+    gmaps_stats = gmaps_service.get_cache_stats()
+    route_stats = get_route_cache_stats()
+    
+    return {
+        **gmaps_stats,
+        **route_stats,
+    }

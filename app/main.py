@@ -1,5 +1,7 @@
 """Main FastAPI application"""
 import logging
+import logging.handlers
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -9,12 +11,54 @@ from fastapi.responses import JSONResponse
 from app.api.v1 import api_router
 from app.config import settings
 from app.db import Base, engine
+from app.services.google_maps import GoogleMapsService
+from app.services.traffic_monitor import start_traffic_monitor, stop_traffic_monitor
+from app.dependencies import get_google_maps_client, get_load_manager, get_alert_service
 
-# Configure logging
-logging.basicConfig(
-    level=settings.log_level,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+# ── Logging setup ──────────────────────────────────────────────────────────
+LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_FORMAT = "%(asctime)s │ %(levelname)-8s │ %(name)-30s │ %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# Root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(settings.log_level)
+
+# Console handler — clean, concise
+console_handler = logging.StreamHandler()
+console_handler.setLevel(settings.log_level)
+console_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
+root_logger.addHandler(console_handler)
+
+# File handler — rotating, keeps last 5 × 5MB files
+file_handler = logging.handlers.RotatingFileHandler(
+    os.path.join(LOG_DIR, "rmc-delivery.log"),
+    maxBytes=5 * 1024 * 1024,  # 5 MB
+    backupCount=5,
+    encoding="utf-8",
 )
+file_handler.setLevel(logging.DEBUG)  # capture everything to file
+file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
+root_logger.addHandler(file_handler)
+
+# Separate error log — only WARNING+
+error_handler = logging.handlers.RotatingFileHandler(
+    os.path.join(LOG_DIR, "rmc-errors.log"),
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
+    encoding="utf-8",
+)
+error_handler.setLevel(logging.WARNING)
+error_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
+root_logger.addHandler(error_handler)
+
+# Quiet noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,10 +75,26 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error creating database tables: {e}")
 
+    # Start background traffic monitor for active trips
+    try:
+        gmaps_service = await get_google_maps_client()
+        load_mgr = get_load_manager()
+        alert_svc = get_alert_service()
+        await start_traffic_monitor(gmaps_service, load_mgr, alert_svc)
+        logger.info("Background traffic monitor started (with RMC load tracking)")
+    except Exception as e:
+        logger.error(f"Failed to start traffic monitor: {e}")
+
     yield
 
     # Shutdown
     logger.info("Shutting down RMC Delivery Route Optimizer API")
+    await stop_traffic_monitor()
+    logger.info("Background traffic monitor stopped")
+    gmaps_service = await get_google_maps_client()
+    if gmaps_service:
+        await gmaps_service.close()
+        logger.info("Google Maps service closed successfully.")
 
 
 # Create FastAPI application

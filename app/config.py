@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     # Database
     database_url: str = "sqlite:///./rmc_delivery.db"
-    db_echo: bool = True
+    db_echo: bool = False
 
     # Google Maps API
     google_maps_api_key: str = ""

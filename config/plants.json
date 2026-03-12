@@ -1,0 +1,202 @@
+[
+  {
+    "id": "holcim_avondale",
+    "name": "Holcim Avondale",
+    "brand": "Holcim",
+    "address": "54 Patiki Road, Avondale, Auckland",
+    "lat": -36.8699446,
+    "lng": 174.6661605,
+    "region": "central_west",
+    "active": true
+  },
+  {
+    "id": "holcim_ranui",
+    "name": "Holcim Ranui",
+    "brand": "Holcim",
+    "address": "47 Airdrie Road, Ranui, Auckland",
+    "lat": -36.8665277,
+    "lng": 174.5938437,
+    "region": "west",
+    "active": true
+  },
+  {
+    "id": "holcim_east_tamaki",
+    "name": "Holcim East Tamaki",
+    "brand": "Holcim",
+    "address": "20 Jarvis Way, Otara, Auckland",
+    "lat": -36.9654179,
+    "lng": 174.8913578,
+    "region": "south_east",
+    "active": true
+  },
+  {
+    "id": "holcim_bombay",
+    "name": "Holcim Bombay",
+    "brand": "Holcim",
+    "address": "587 Ridge Road, Pokeno",
+    "lat": -37.2158101,
+    "lng": 174.9976564,
+    "region": "south",
+    "active": true
+  },
+  {
+    "id": "allied_mt_wellington",
+    "name": "Allied Mt Wellington",
+    "brand": "Allied",
+    "address": "20 Leon Leicester Ave, Mt Wellington, Auckland",
+    "lat": -36.9037741,
+    "lng": 174.8207967,
+    "region": "central_east",
+    "active": true
+  },
+  {
+    "id": "allied_silverdale",
+    "name": "Allied Silverdale",
+    "brand": "Allied",
+    "address": "10 Furnace Place, Silverdale, Auckland",
+    "lat": -36.6258573,
+    "lng": 174.6806403,
+    "region": "north",
+    "active": true
+  },
+  {
+    "id": "firth_manukau",
+    "name": "Firth Manukau",
+    "brand": "Firth",
+    "address": "9 Narek Place, Manukau City Centre, Auckland",
+    "lat": -36.9940758,
+    "lng": 174.8629765,
+    "region": "south",
+    "active": true
+  },
+  {
+    "id": "firth_penrose",
+    "name": "Firth Penrose",
+    "brand": "Firth",
+    "address": "810 Great South Road, Penrose, Auckland",
+    "lat": -36.9112830,
+    "lng": 174.8190881,
+    "region": "central_south",
+    "active": true
+  },
+  {
+    "id": "atlas_mt_wellington",
+    "name": "Atlas Mt Wellington",
+    "brand": "Atlas",
+    "address": "25 Morrin Road, Mt Wellington, Auckland",
+    "lat": -36.8913698,
+    "lng": 174.8519333,
+    "region": "central_east",
+    "active": true
+  },
+  {
+    "id": "atlas_wiri",
+    "name": "Atlas Wiri",
+    "brand": "Atlas",
+    "address": "101 Roscommon Road, Wiri, Auckland",
+    "lat": -37.0003696,
+    "lng": 174.8513972,
+    "region": "south",
+    "active": true
+  },
+  {
+    "id": "counties_drury",
+    "name": "Counties Ready Mix Drury",
+    "brand": "Counties",
+    "address": "14 Bremner Road, Drury, Auckland",
+    "lat": -37.1033563,
+    "lng": 174.9458932,
+    "region": "south",
+    "active": true
+  },
+  {
+    "id": "cemix_onehunga",
+    "name": "Cemix Onehunga",
+    "brand": "Cemix",
+    "address": "19 Alfred Street, Onehunga, Auckland",
+    "lat": -36.9248992,
+    "lng": 174.7952829,
+    "region": "central_south",
+    "active": true
+  },
+  {
+    "id": "ocean_east_tamaki",
+    "name": "Ocean Concrete East Tamaki",
+    "brand": "Ocean",
+    "address": "41 Smales Road, East Tamaki, Auckland",
+    "lat": -36.9441186,
+    "lng": 174.9012626,
+    "region": "south_east",
+    "active": true
+  },
+  {
+    "id": "concretec_pokeno",
+    "name": "Concretec Pokeno",
+    "brand": "Concretec",
+    "address": "587 Ridge Road, Pokeno",
+    "lat": -37.2169540,
+    "lng": 174.9989982,
+    "region": "south",
+    "active": true
+  },
+  {
+    "id": "liquidstone_swanson",
+    "name": "Liquidstone Swanson",
+    "brand": "Liquidstone",
+    "address": "8 Oneills Road, Swanson, Auckland",
+    "lat": -36.8668534,
+    "lng": 174.5857488,
+    "region": "west",
+    "active": true
+  },
+  {
+    "id": "grc_henderson",
+    "name": "GRC Henderson",
+    "brand": "GRC",
+    "address": "84 Henderson Valley Road, Henderson, Auckland",
+    "lat": -36.8897635,
+    "lng": 174.6276089,
+    "region": "west",
+    "active": true
+  },
+  {
+    "id": "akl_landscape_st_johns",
+    "name": "Auckland Landscape St Johns",
+    "brand": "Auckland Landscape",
+    "address": "88a Merton Road, St Johns, Auckland",
+    "lat": -36.8804118,
+    "lng": 174.8537741,
+    "region": "east",
+    "active": true
+  },
+  {
+    "id": "citi_whenuapai",
+    "name": "Citi Landscape Whenuapai",
+    "brand": "Citi",
+    "address": "180 Fred Taylor Drive, Whenuapai, Auckland",
+    "lat": -36.8012401,
+    "lng": 174.5962482,
+    "region": "north_west",
+    "active": true
+  },
+  {
+    "id": "consult_hub_takapuna",
+    "name": "ConsultHub Takapuna",
+    "brand": "ConsultHub",
+    "address": "10 Eric Price Avenue, Takapuna, Auckland",
+    "lat": -36.7762928,
+    "lng": 174.7738345,
+    "region": "north_shore",
+    "active": true
+  },
+  {
+    "id": "aeon_east_tamaki",
+    "name": "Aeon Construction East Tamaki",
+    "brand": "Aeon",
+    "address": "63 Lady Ruby Drive, East Tamaki, Auckland",
+    "lat": -36.9471619,
+    "lng": 174.9016068,
+    "region": "south_east",
+    "active": true
+  }
+]
