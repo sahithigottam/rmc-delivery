@@ -507,6 +507,20 @@ class TripService:
         )
         return [self._to_response(t) for t in trips]
 
+    def delete_trip(self, trip_id: int) -> None:
+        """Hard-delete a trip. Only allowed for cancelled or completed trips."""
+        trip = self._get_trip(trip_id)
+        if trip.status not in ("cancelled", "completed"):
+            raise ValueError(
+                f"Cannot delete trip in '{trip.status}' state. "
+                "Only cancelled or completed trips can be deleted."
+            )
+        # Delete associated events first (cascade safety)
+        self.db.query(TripEvent).filter(TripEvent.trip_id == trip_id).delete()
+        self.db.delete(trip)
+        self.db.commit()
+        logger.info(f"Trip {trip_id} deleted.")
+
     def get_trip_events(self, trip_id: int, limit: int = 50) -> List[TripEventResponse]:
         events = (
             self.db.query(TripEvent)

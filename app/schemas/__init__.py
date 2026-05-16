@@ -280,6 +280,28 @@ class PlantOut(BaseModel):
     active: bool = True
 
 
+class PlantCreate(BaseModel):
+    """Payload for creating or fully updating a plant."""
+    name: str
+    brand: str
+    address: str
+    lat: float
+    lng: float
+    region: str
+    active: bool = True
+
+
+class PlantUpdate(BaseModel):
+    """Partial update — all fields optional."""
+    name: Optional[str] = None
+    brand: Optional[str] = None
+    address: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    region: Optional[str] = None
+    active: Optional[bool] = None
+
+
 class BrandAnalysisRequest(BaseModel):
     """Request brand analysis: pick a brand + destination, get ranked predictions."""
     brand: str = Field(..., description="Plant brand, e.g. 'Holcim'")
@@ -393,6 +415,8 @@ __all__ = [
     "TripRerouteInfo",
     # Plants / dispatch
     "PlantOut",
+    "PlantCreate",
+    "PlantUpdate",
     "BrandAnalysisRequest",
     "PlantPredictionResult",
     "BrandAnalysisResponse",

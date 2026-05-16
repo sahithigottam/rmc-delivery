@@ -211,6 +211,22 @@ async def cancel_trip(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.delete(
+    "/{trip_id}",
+    status_code=204,
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+)
+async def delete_trip(
+    trip_id: int,
+    trip_service: TripService = Depends(get_trip_service),
+) -> None:
+    """Hard-delete a trip. Only cancelled or completed trips can be deleted."""
+    try:
+        trip_service.delete_trip(trip_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 # ── Dispatch flow ─────────────────────────────────────────────────────────
 
 

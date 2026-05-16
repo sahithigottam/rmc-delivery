@@ -11,8 +11,11 @@ Flow the UI follows:
   7. POST /trips/{id}/complete   → outcome recorded in DB
 """
 import asyncio
+import json
 import logging
+import re
 import time
+from pathlib import Path
 from typing import List, Optional
 
 from cachetools import TTLCache
@@ -22,12 +25,36 @@ from app.dependencies import get_prediction_service
 from app.schemas import (
     BrandAnalysisRequest,
     BrandAnalysisResponse,
+    PlantCreate,
     PlantOut,
     PlantPredictionResult,
+    PlantUpdate,
 )
 from app.services.llm_analyzer import LLMAnalyzer
 from app.services.plant_locator import PlantLocator
 from app.services.prediction import PredictionService
+
+_PLANTS_JSON = Path(__file__).parent.parent.parent.parent / "config" / "plants.json"
+
+
+def _load_all_plants() -> List[dict]:
+    """Load ALL plants (including inactive) directly from file."""
+    with open(_PLANTS_JSON, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_plants(plants: List[dict]) -> None:
+    """Write plants list back to file and bust the PlantLocator cache."""
+    with open(_PLANTS_JSON, "w", encoding="utf-8") as f:
+        json.dump(plants, f, indent=2, ensure_ascii=False)
+    # Bust singleton cache so next request reloads
+    PlantLocator._plants = None
+
+
+def _make_id(name: str, brand: str) -> str:
+    """Generate a slug ID from brand + name."""
+    slug = re.sub(r"[^a-z0-9]+", "_", (brand + " " + name).lower()).strip("_")
+    return slug
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/plants", tags=["plants"])
@@ -112,6 +139,87 @@ def get_plant(plant_id: str):
     if not plant:
         raise HTTPException(status_code=404, detail=f"Plant '{plant_id}' not found")
     return _plant_to_schema(plant)
+
+
+# ── CRUD write endpoints ─────────────────────────────────────────────────────
+
+@router.post("", response_model=PlantOut, status_code=201, summary="Add a new plant")
+def create_plant(body: PlantCreate):
+    plants = _load_all_plants()
+    new_id = _make_id(body.name, body.brand)
+    # Ensure uniqueness
+    existing_ids = {p["id"] for p in plants}
+    base_id, counter = new_id, 2
+    while new_id in existing_ids:
+        new_id = f"{base_id}_{counter}"
+        counter += 1
+    new_plant = {
+        "id": new_id,
+        "name": body.name,
+        "brand": body.brand,
+        "address": body.address,
+        "lat": body.lat,
+        "lng": body.lng,
+        "region": body.region,
+        "active": body.active,
+    }
+    plants.append(new_plant)
+    _save_plants(plants)
+    logger.info("Plant created: %s", new_id)
+    return _plant_to_schema(new_plant)
+
+
+@router.put("/{plant_id}", response_model=PlantOut, summary="Replace a plant")
+def update_plant(plant_id: str, body: PlantCreate):
+    plants = _load_all_plants()
+    idx = next((i for i, p in enumerate(plants) if p["id"] == plant_id), None)
+    if idx is None:
+        raise HTTPException(status_code=404, detail=f"Plant '{plant_id}' not found")
+    updated = {
+        "id": plant_id,
+        "name": body.name,
+        "brand": body.brand,
+        "address": body.address,
+        "lat": body.lat,
+        "lng": body.lng,
+        "region": body.region,
+        "active": body.active,
+    }
+    plants[idx] = updated
+    _save_plants(plants)
+    logger.info("Plant updated: %s", plant_id)
+    return _plant_to_schema(updated)
+
+
+@router.patch("/{plant_id}", response_model=PlantOut, summary="Partial update / toggle active")
+def patch_plant(plant_id: str, body: PlantUpdate):
+    plants = _load_all_plants()
+    idx = next((i for i, p in enumerate(plants) if p["id"] == plant_id), None)
+    if idx is None:
+        raise HTTPException(status_code=404, detail=f"Plant '{plant_id}' not found")
+    p = plants[idx]
+    if body.name is not None:    p["name"] = body.name
+    if body.brand is not None:   p["brand"] = body.brand
+    if body.address is not None: p["address"] = body.address
+    if body.lat is not None:     p["lat"] = body.lat
+    if body.lng is not None:     p["lng"] = body.lng
+    if body.region is not None:  p["region"] = body.region
+    if body.active is not None:  p["active"] = body.active
+    plants[idx] = p
+    _save_plants(plants)
+    logger.info("Plant patched: %s", plant_id)
+    return _plant_to_schema(p)
+
+
+@router.delete("/{plant_id}", status_code=204, summary="Delete a plant")
+def delete_plant(plant_id: str):
+    plants = _load_all_plants()
+    original_len = len(plants)
+    plants = [p for p in plants if p["id"] != plant_id]
+    if len(plants) == original_len:
+        raise HTTPException(status_code=404, detail=f"Plant '{plant_id}' not found")
+    _save_plants(plants)
+    logger.info("Plant deleted: %s", plant_id)
 
 
 # ── Brand analysis ────────────────────────────────────────────────────────
