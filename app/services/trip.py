@@ -51,6 +51,13 @@ REROUTE_RATIO_THRESHOLD = 1.15           # 15% slower than expected → reroute
 TRAFFIC_CHECK_INTERVAL_SECONDS = 120     # check traffic every 2 minutes
 MIN_REMAINING_KM_FOR_CHECK = 1.0         # don't bother checking if < 1km left
 REROUTE_COOLDOWN_SECONDS = 180           # don't reroute more than once per 3 min
+TRAFFIC_CHECK_MIN_MOVEMENT_KM = 0.2      # skip Directions call if truck moved < 200m since last check
+TRAFFIC_CHECK_MAX_SKIP_SECONDS = 480     # always call API after 8 min regardless of movement
+
+# ── Per-trip position tracking for API call deduplication ─────────────────
+# Maps trip_id → (lat, lng) at the time of the last successful Directions call.
+# In-memory only — resets on server restart (acceptable; just causes one extra API call).
+_last_checked_positions: Dict[int, tuple] = {}
 
 
 # ── SSE subscriber registry ───────────────────────────────────────────────
@@ -491,6 +498,15 @@ class TripService:
         )
         return [self._to_response(t) for t in trips]
 
+    def get_all_trips(self, limit: int = 100) -> List[TripResponse]:
+        trips = (
+            self.db.query(Trip)
+            .order_by(Trip.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [self._to_response(t) for t in trips]
+
     def get_trip_events(self, trip_id: int, limit: int = 50) -> List[TripEventResponse]:
         events = (
             self.db.query(TripEvent)
@@ -534,7 +550,24 @@ class TripService:
         current_lat = trip.current_lat or trip.start_lat
         current_lng = trip.current_lng or trip.start_lng
 
-        # Map priority → traffic_model
+        # ── Skip Directions API call if truck hasn't moved meaningfully ──
+        # This is the primary cost-saving guard: a stationary or slow-moving
+        # truck generates the same ETA, so there's no point calling Google again.
+        prev = _last_checked_positions.get(trip_id)
+        if prev and trip.last_traffic_check_at:
+            moved_km = self._haversine(prev[0], prev[1], current_lat, current_lng)
+            time_since_s = (
+                datetime.now(timezone.utc)
+                - trip.last_traffic_check_at.replace(tzinfo=timezone.utc)
+            ).total_seconds()
+            if moved_km < TRAFFIC_CHECK_MIN_MOVEMENT_KM and time_since_s < TRAFFIC_CHECK_MAX_SKIP_SECONDS:
+                logger.debug(
+                    f"Trip {trip_id}: skipping Directions API call "
+                    f"(moved {moved_km * 1000:.0f}m, last check {time_since_s:.0f}s ago)"
+                )
+                return None
+
+
         traffic_model_map = {
             "urgent": "pessimistic", "high": "pessimistic",
             "normal": "best_guess",
@@ -543,7 +576,9 @@ class TripService:
         traffic_model = traffic_model_map.get(trip.priority or "normal", "best_guess")
 
         try:
-            # Call Google Directions from current position
+            # Call Google Directions from current position.
+            # coarse_start=True snaps the start coords to a ~1.1km grid so minor
+            # truck movements reuse cached responses instead of triggering new API calls.
             directions = await self.google_maps.get_directions(
                 start_lat=current_lat,
                 start_lng=current_lng,
@@ -553,6 +588,7 @@ class TripService:
                 traffic_model=traffic_model,
                 alternatives=False,
                 avoid=trip.avoid_options,
+                coarse_start=True,
             )
 
             if directions.get("status") != "OK":
@@ -562,6 +598,9 @@ class TripService:
                     "error": directions.get("error_message", "Unknown"),
                 }, lat=current_lat, lng=current_lng)
                 return None
+
+            # Record position at time of this successful API call
+            _last_checked_positions[trip_id] = (current_lat, current_lng)
 
             route_data = directions["routes"][0]
             leg = route_data["legs"][0]

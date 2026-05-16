@@ -1,7 +1,7 @@
 """Route optimization and calculation service (Feature 1)"""
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, List
 
 from cachetools import TTLCache
@@ -109,10 +109,23 @@ class RouteService:
                 route_request.end.address
             )
 
-            # Get departure time for traffic calculation
+            # Get departure time for traffic calculation.
+            # Google Directions rejects past departure_time with ZERO_RESULTS,
+            # so clamp to now if the scheduled time has already passed.
             departure_time = None
             if route_request.departure_datetime:
-                departure_time = int(route_request.departure_datetime.timestamp())
+                dt = route_request.departure_datetime
+                now = datetime.now(timezone.utc)
+                # Ensure tz-aware comparison
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt <= now:
+                    logger.info(
+                        f"departure_datetime {dt.isoformat()} is in the past — using 'now' for Directions API"
+                    )
+                    departure_time = int(now.timestamp())
+                else:
+                    departure_time = int(dt.timestamp())
 
             # Convert waypoints from Coordinate objects to tuples
             waypoints_tuples = None
@@ -150,9 +163,10 @@ class RouteService:
 
             # Parse response
             if directions_data.get("status") != "OK":
-                error_msg = directions_data.get("error_message", "Unknown error")
-                logger.error(f"Google Directions API error: {error_msg}")
-                raise ValueError(f"Route calculation failed: {error_msg}")
+                status_code = directions_data.get("status", "UNKNOWN")
+                error_msg = directions_data.get("error_message") or status_code
+                logger.error(f"Google Directions API error: {status_code} — {error_msg}")
+                raise ValueError(f"Route calculation failed: {status_code} — {error_msg}")
 
             # Get all available routes
             all_routes = directions_data.get("routes", [])

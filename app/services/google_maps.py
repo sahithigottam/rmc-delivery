@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 GEOCODE_CACHE_TTL = 86400  # 24 hours - addresses don't change often
 GEOCODE_CACHE_SIZE = 1000  # Max number of cached addresses
 
-DIRECTIONS_CACHE_TTL = 300  # 5 minutes - traffic conditions change
+DIRECTIONS_CACHE_TTL = 600  # 10 minutes — traffic doesn't change meaningfully in < 10 min
 DIRECTIONS_CACHE_SIZE = 500  # Max number of cached routes
 
 
@@ -49,12 +49,25 @@ class GoogleMapsService:
         alternatives: bool = False,
         avoid: Optional[List[str]] = None,
         waypoints: Optional[List[Tuple[float, float]]] = None,
+        coarse_start: bool = False,
     ) -> str:
-        """Generate a cache key for directions request"""
-        # Round coordinates to 5 decimal places (~1m precision) for better cache hits
+        """Generate a cache key for directions request.
+        
+        coarse_start=True snaps the start coordinates to a ~1.1km grid so that
+        small truck movements (e.g. during background traffic checks) reuse cached
+        results instead of triggering a new API call.
+        """
+        if coarse_start:
+            # Round to 2 decimal places ≈ 111m per unit → ~1.1km grid cell
+            s_lat = round(start_lat, 2)
+            s_lng = round(start_lng, 2)
+        else:
+            s_lat = start_lat
+            s_lng = start_lng
+
         key_parts = [
-            f"{start_lat:.5f}",
-            f"{start_lng:.5f}",
+            f"{s_lat:.5f}" if not coarse_start else f"{s_lat:.2f}",
+            f"{s_lng:.5f}" if not coarse_start else f"{s_lng:.2f}",
             f"{end_lat:.5f}",
             f"{end_lng:.5f}",
         ]
@@ -103,6 +116,7 @@ class GoogleMapsService:
         alternatives: bool = False,
         avoid: Optional[List[str]] = None,
         waypoints: Optional[List[Tuple[float, float]]] = None,
+        coarse_start: bool = False,
     ) -> Dict:
         """
         Get directions between two points using Google Directions API.
@@ -123,7 +137,7 @@ class GoogleMapsService:
         # Check cache first
         cache_key = self._get_directions_cache_key(
             start_lat, start_lng, end_lat, end_lng, departure_time,
-            alternatives, avoid, waypoints
+            alternatives, avoid, waypoints, coarse_start=coarse_start
         )
         
         if cache_key in self._directions_cache:

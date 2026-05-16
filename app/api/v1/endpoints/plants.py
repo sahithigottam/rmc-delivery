@@ -12,8 +12,10 @@ Flow the UI follows:
 """
 import asyncio
 import logging
+import time
 from typing import List, Optional
 
+from cachetools import TTLCache
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.dependencies import get_prediction_service
@@ -29,6 +31,12 @@ from app.services.prediction import PredictionService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/plants", tags=["plants"])
+
+# Cache the full analyse_brand response for 10 minutes.
+# Key: (brand_lower, job_site_address_lower, concrete_mix_upper, 10-min time bucket)
+# This prevents repeat API calls when a dispatcher re-opens the panel or clicks
+# Analyse within the same 10-minute window.
+_analysis_cache: TTLCache = TTLCache(maxsize=200, ttl=600)
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -144,6 +152,18 @@ async def analyse_brand(
             detail="`job_site_data` must contain a `display_name` field.",
         )
 
+    # ── Cache lookup ──────────────────────────────────────────────────
+    # Key uses a 10-min time bucket so cache entries expire naturally within the TTL.
+    time_bucket = int(time.time()) // 600
+    cache_key = (req.brand.lower(), job_site_address.lower(), req.concrete_mix.upper(), time_bucket)
+    cached = _analysis_cache.get(cache_key)
+    if cached is not None:
+        logger.info(
+            "analyse_brand cache HIT: brand=%s, job_site=%s (saved %d Google API calls)",
+            req.brand, job_site_address[:40], len(cached.results),
+        )
+        return cached
+
     loc = _locator()
     all_plants = loc._plants or []
 
@@ -240,7 +260,7 @@ async def analyse_brand(
             except Exception as exc:
                 logger.warning("LLM comparison failed: %s", exc)
 
-    return BrandAnalysisResponse(
+    response = BrandAnalysisResponse(
         brand=req.brand,
         job_site_address=job_site_address,
         concrete_mix=req.concrete_mix,
@@ -249,3 +269,5 @@ async def analyse_brand(
         best_plant_id=best_id,
         llm_comparison=llm_comparison,
     )
+    _analysis_cache[cache_key] = response
+    return response

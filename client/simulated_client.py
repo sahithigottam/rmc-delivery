@@ -583,6 +583,29 @@ footer { display: none !important; }
 .step-instruction { font-size: 14px; line-height: 1.5; color: var(--md-on-surface); letter-spacing: 0.25px; }
 .step-distance { font-size: 12px; color: var(--md-on-surface-variant); margin-top: 2px; }
 
+/* ── PLANT SELECTOR ─────────────────────────────────── */
+#plant-selector {
+    padding: 8px 20px 16px !important;
+    gap: 12px !important;
+    background: white !important;
+    border-bottom: 1px solid var(--md-outline-variant) !important;
+}
+#plant-selector > div { gap: 8px !important; }
+#analyse-btn {
+    margin: 0 !important;
+    border: 1px solid var(--md-primary) !important;
+    border-radius: var(--md-radius-full) !important;
+    min-height: 40px !important;
+    background: transparent !important;
+    color: var(--md-primary) !important;
+    font-weight: 500 !important; font-size: 13px !important;
+    font-family: inherit !important; letter-spacing: 0.1px;
+    cursor: pointer;
+    transition: background 0.2s !important;
+}
+#analyse-btn:hover { background: rgba(103,80,164,0.08) !important; }
+.plant-result-row { transition: background 0.15s; }
+
 /* ── Mobile ─────────────────────────────────────────── */
 @media (max-width: 768px) {
     #app-body { flex-direction: column !important; height: auto !important; overflow: auto !important; }
@@ -770,6 +793,102 @@ def _build_route_choices(data: dict):
             label = f"⚡ {label}"
         choices.append((label, str(idx)))
     return gr.update(choices=choices, value=str(selected))
+
+
+# ============================================================================
+# Plant selector helpers
+# ============================================================================
+
+async def load_brands_choices():
+    """Fetch brand list from the API to populate the brand dropdown on load."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{API_BASE_URL}/plants/brands")
+            if resp.status_code == 200:
+                brands = resp.json()
+                return gr.update(choices=brands, value=brands[0] if brands else None)
+    except Exception:
+        pass
+    return gr.update(choices=[], value=None)
+
+
+def _build_plant_results_html(data: dict) -> str:
+    results = data.get("results", [])
+    best_id = data.get("best_plant_id")
+    if not results:
+        return '<div style="padding:12px 20px;font-size:13px;color:var(--md-on-surface-variant);">No plants found.</div>'
+    risk_colors = {
+        "low": "#34a853", "medium": "#fbbc04",
+        "high": "#ea4335", "critical": "#b3261e",
+    }
+    html = '<div style="display:flex;flex-direction:column;">'
+    for r in results:
+        plant = r.get("plant", {})
+        pid = plant.get("id")
+        name = plant.get("name", "")
+        address = plant.get("address", "")
+        remaining = r.get("remaining_life_minutes")
+        eta = r.get("adjusted_eta_minutes")
+        risk = r.get("risk_level", "")
+        error = r.get("error")
+        is_best = pid == best_id
+        bg = "#f8f4ff" if is_best else "white"
+        rc = risk_colors.get(risk, "#79747e")
+        if error:
+            html += (
+                f'<div style="padding:10px 20px;border-bottom:1px solid #e8eaed;opacity:.65;">'
+                f'<div style="font-size:13px;font-weight:500;">{name}</div>'
+                f'<div style="font-size:11px;color:#ea4335;">⚠ {error}</div></div>'
+            )
+        else:
+            badge = (
+                ' <span style="background:#eaddff;color:#21005d;border-radius:100px;'
+                'padding:2px 8px;font-size:10px;font-weight:600;margin-left:4px;'
+                'vertical-align:middle;">BEST</span>'
+            ) if is_best else ""
+            eta_str = f"{eta:.0f}" if eta is not None else "—"
+            rem_str = f"{remaining:.0f}" if remaining is not None else "—"
+            escaped_bg = bg.replace("'", "\\'")
+            html += (
+                f'<div class="plant-result-row" data-address="{address}" '
+                f'style="padding:10px 20px;border-bottom:1px solid #e8eaed;background:{bg};cursor:pointer;" '
+                f'onclick="selectPlant(this)" '
+                f'onmouseenter="this.style.background=\'rgba(103,80,164,.07)\'" '
+                f'onmouseleave="this.style.background=\'{escaped_bg}\'">'
+                f'<div style="display:flex;align-items:center;justify-content:space-between;">'
+                f'<span style="font-size:13px;font-weight:500;color:#1c1b1f;">{name}{badge}</span>'
+                f'<span style="font-size:11px;font-weight:600;color:{rc};text-transform:uppercase;">{risk}</span></div>'
+                f'<div style="display:flex;gap:16px;margin-top:3px;font-size:12px;color:#49454f;">'
+                f'<span>ETA <strong style="color:#1c1b1f;">{eta_str} min</strong></span>'
+                f'<span>Life <strong style="color:{rc};">{rem_str} min</strong></span></div>'
+                f'<div style="font-size:11px;color:#9aa0a6;margin-top:2px;white-space:nowrap;'
+                f'overflow:hidden;text-overflow:ellipsis;">{address}</div>'
+                f'</div>'
+            )
+    html += "</div>"
+    return html
+
+
+async def analyse_plants(brand: str, end_address: str, concrete_mix: str) -> str:
+    """Call /plants/analyse and return ranked plant result cards."""
+    if not brand or not end_address:
+        return '<div style="padding:12px 20px;font-size:13px;color:var(--md-on-surface-variant);">Enter a destination address and select a brand first.</div>'
+    try:
+        payload = {
+            "brand": brand,
+            "job_site_data": {"display_name": end_address},
+            "concrete_mix": concrete_mix or "standard",
+            "top_n": 5,
+            "include_llm_analysis": False,
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{API_BASE_URL}/plants/analyse", json=payload)
+            if resp.status_code == 200:
+                return _build_plant_results_html(resp.json())
+            err = resp.json().get("detail", "Unknown error")
+            return f'<div style="padding:12px 20px;font-size:13px;color:var(--md-error);">{err}</div>'
+    except Exception as e:
+        return f'<div style="padding:12px 20px;font-size:13px;color:var(--md-error);">Connection error: {e}</div>'
 
 
 # ============================================================================
@@ -1373,6 +1492,17 @@ HEAD_HTML = """
     } else {
         setTimeout(initAutocomplete, 1500);
     }
+
+    function selectPlant(el) {
+        const addr = el.dataset.address;
+        const startWrapper = document.getElementById('start-address');
+        const input = startWrapper ? startWrapper.querySelector('input, textarea') : null;
+        if (input) {
+            input.value = addr;
+            input.dispatchEvent(new Event('input', {bubbles: true}));
+            input.dispatchEvent(new Event('change', {bubbles: true}));
+        }
+    }
 </script>
 """
 
@@ -1415,6 +1545,22 @@ with gr.Blocks(title="RMC Route Optimizer — Simulation") as app:
 
                 # Status
                 status_output = gr.HTML(value='<div id="status-toast" class="hidden"></div>')
+
+                # Plant Selector
+                gr.HTML('<div class="section-label">Pick Plant</div>')
+                with gr.Column(elem_id="plant-selector"):
+                    with gr.Row():
+                        brand_dropdown = gr.Dropdown(
+                            label="Brand", choices=[], scale=3,
+                            elem_classes=["md-dropdown"],
+                        )
+                        concrete_mix_input = gr.Dropdown(
+                            label="Mix",
+                            choices=["standard", "high_strength", "rapid_set"],
+                            value="standard", scale=2, elem_classes=["md-dropdown"],
+                        )
+                    analyse_btn = gr.Button("Analyse Plants", elem_id="analyse-btn")
+                    plant_results = gr.HTML(value="")
 
                 # Metrics
                 with gr.Column(elem_id="metrics-section"):
@@ -1503,6 +1649,13 @@ with gr.Blocks(title="RMC Route Optimizer — Simulation") as app:
 
     calculate_btn.click(fn=estimate_route, inputs=route_inputs, outputs=route_outputs)
     selected_route_idx.change(fn=estimate_route, inputs=route_inputs, outputs=route_outputs)
+
+    app.load(fn=load_brands_choices, outputs=[brand_dropdown])
+    analyse_btn.click(
+        fn=analyse_plants,
+        inputs=[brand_dropdown, end_address, concrete_mix_input],
+        outputs=[plant_results],
+    )
 
     sim_inputs = route_inputs + [sim_speed]
 

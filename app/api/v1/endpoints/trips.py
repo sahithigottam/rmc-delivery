@@ -78,6 +78,15 @@ async def list_active_trips(
     return trip_service.get_active_trips()
 
 
+@router.get("/all", response_model=List[TripResponse])
+async def list_all_trips(
+    limit: int = 100,
+    trip_service: TripService = Depends(get_trip_service),
+) -> List[TripResponse]:
+    """List all trips (any status), most recent first."""
+    return trip_service.get_all_trips(limit=limit)
+
+
 @router.get("/{trip_id}", response_model=TripResponse)
 async def get_trip(
     trip_id: int,
