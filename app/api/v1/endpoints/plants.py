@@ -34,7 +34,7 @@ from app.services.llm_analyzer import LLMAnalyzer
 from app.services.plant_locator import PlantLocator
 from app.services.prediction import PredictionService
 
-_PLANTS_JSON = Path(__file__).parent.parent.parent.parent / "config" / "plants.json"
+_PLANTS_JSON = Path(__file__).parent.parent.parent.parent.parent / "config" / "plants.json"
 
 
 def _load_all_plants() -> List[dict]:
