@@ -74,7 +74,7 @@
     "name": "Firth Penrose",
     "brand": "Firth",
     "address": "810 Great South Road, Penrose, Auckland",
-    "lat": -36.9112830,
+    "lat": -36.911283,
     "lng": 174.8190881,
     "region": "central_south",
     "active": true
@@ -134,7 +134,7 @@
     "name": "Concretec Pokeno",
     "brand": "Concretec",
     "address": "587 Ridge Road, Pokeno",
-    "lat": -37.2169540,
+    "lat": -37.216954,
     "lng": 174.9989982,
     "region": "south",
     "active": true

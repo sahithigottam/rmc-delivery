@@ -218,4 +218,5 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-rmc_delivery.db 
+rmc_delivery.db
+*.db
