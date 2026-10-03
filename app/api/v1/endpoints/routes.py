@@ -2,12 +2,14 @@
 import logging
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.dependencies import get_route_service, get_google_maps_client
 from app.schemas import RouteCreate, RouteResponse, RerouteRequest, RerouteResponse, ErrorResponse
 from app.services.route import RouteService, get_route_cache_stats
 from app.services.google_maps import GoogleMapsService
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +81,27 @@ async def estimate_route(
             f"to {route_request.end.address}"
         )
 
-        result = await route_service.estimate_route(route_request)
-        return result
+        # Proxy to cloud routing service
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            url = f"{settings.routing_service_url}/api/v1/routes/estimate"
+            response = await client.post(
+                url,
+                json=route_request.model_dump(),
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                error_detail = response.json().get("detail", "Cloud routing service error")
+                logger.error(f"Cloud routing error ({response.status_code}): {error_detail}")
+                raise HTTPException(status_code=response.status_code, detail=error_detail)
 
+    except httpx.RequestError as e:
+        logger.error(f"Cloud service connection error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Cloud routing service unavailable. Please try again later.",
+        )
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -184,16 +204,32 @@ async def check_reroute(
     ```
     """
     try:
-        result = await route_service.check_reroute(
-            current_lat=reroute_request.current_lat,
-            current_lng=reroute_request.current_lng,
-            end_address=reroute_request.end.address,
-            vehicle_type=reroute_request.vehicle_type,
-            priority=reroute_request.priority,
-            avoid=reroute_request.avoid,
-            original_duration=original_duration,
+        # Proxy to cloud routing service
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            url = f"{settings.routing_service_url}/api/v1/routes/reroute"
+            params = {}
+            if original_duration is not None:
+                params["original_duration"] = original_duration
+            
+            response = await client.post(
+                url,
+                json=reroute_request.model_dump(),
+                params=params,
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                error_detail = response.json().get("detail", "Cloud routing service error")
+                logger.error(f"Cloud routing error ({response.status_code}): {error_detail}")
+                raise HTTPException(status_code=response.status_code, detail=error_detail)
+    
+    except httpx.RequestError as e:
+        logger.error(f"Cloud service connection error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Cloud routing service unavailable. Please try again later.",
         )
-        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
