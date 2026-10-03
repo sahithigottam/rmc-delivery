@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     google_maps_api_key: str = ""
 
     # Cloud Routing Service
-    routing_service_url: str = "https://exemplary-education-production-86e6.up.railway.app"
+    routing_service_url: str = "https://rmc-routing-service-production.up.railway.app"
 
     # FastAPI
     log_level: str = "INFO"
