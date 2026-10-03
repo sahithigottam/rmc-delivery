@@ -14,8 +14,8 @@ class Settings(BaseSettings):
     
     # Database
     # For local: sqlite:///./rmc_routing.db
-    # For cloud: provide full PostgreSQL URL
-    DATABASE_URL: str = "sqlite:///./rmc_routing.db"
+    # For cloud: provide full PostgreSQL URL or it will use in-memory SQLite
+    DATABASE_URL: str = "sqlite:///:memory:"
     
     # Google Maps API
     GOOGLE_MAPS_API_KEY: str = ""
