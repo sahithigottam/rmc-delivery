@@ -15,3 +15,5 @@ flake8
 mypy
 alembic
 python-multipart
+cachetools
+google-maps-services
