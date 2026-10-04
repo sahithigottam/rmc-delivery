@@ -16,4 +16,4 @@ mypy
 alembic
 python-multipart
 cachetools
-google-maps-services
+googlemaps
