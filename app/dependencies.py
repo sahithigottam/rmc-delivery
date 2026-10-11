@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import Depends
 from sqlalchemy.orm import Session
 
+from app.auth import Principal, require_plant_admin
 from app.db import get_db
 from app.rmc.alerts import AlertService, LoggingAlertHandler, SSEAlertHandler
 from app.rmc.load_manager import LoadManager
@@ -43,9 +44,13 @@ def get_alert_service() -> AlertService:
 def get_route_service(
     db: Session = Depends(get_db),
     google_maps: GoogleMapsService = Depends(get_google_maps_client),
+    principal: Principal = Depends(require_plant_admin),
 ) -> RouteService:
     """Dependency for Route service"""
-    return RouteService(db, google_maps)
+    return RouteService(
+        db, google_maps, organization_id=principal.organization_id,
+        actor_user_id=principal.user_id,
+    )
 
 
 def get_trip_service(
@@ -53,6 +58,7 @@ def get_trip_service(
     google_maps: GoogleMapsService = Depends(get_google_maps_client),
     load_manager: LoadManager = Depends(get_load_manager),
     alert_service: AlertService = Depends(get_alert_service),
+    principal: Principal = Depends(require_plant_admin),
 ) -> TripService:
     """Dependency for Trip service (with RMC load management)"""
     return TripService(
@@ -60,11 +66,20 @@ def get_trip_service(
         google_maps=google_maps,
         load_manager=load_manager,
         alert_service=alert_service,
+        organization_id=principal.organization_id,
+        actor_user_id=principal.user_id,
+        is_super_admin=principal.is_super_admin,
     )
 
 
 def get_prediction_service(
     google_maps: GoogleMapsService = Depends(get_google_maps_client),
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_plant_admin),
 ) -> PredictionService:
     """Dependency for Prediction service (pre-trip dispatcher decision support)"""
-    return PredictionService(google_maps)
+    return PredictionService(
+        google_maps,
+        db,
+        organization_id=principal.organization_id,
+    )

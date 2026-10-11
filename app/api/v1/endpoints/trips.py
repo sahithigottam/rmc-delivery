@@ -63,6 +63,8 @@ async def start_trip(
     """
     try:
         return await trip_service.start_trip(req)
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -120,9 +122,11 @@ async def update_position(
 ) -> TripResponse:
     """
     Report truck's GPS position. The backend will:
+    Accept optional timezone-aware `captured_at` and preserve it in UTC.
+    Reject future, duplicate, or out-of-order timestamps without changing position.
     1. Update the trip's current position
     2. Estimate remaining distance (haversine)
-    3. Auto-complete if within 200m of destination
+    3. Auto-complete if within 100m of destination
     """
     try:
         return await trip_service.update_position(trip_id, pos)
@@ -190,8 +194,11 @@ async def complete_trip(
     ```json
     { "success": true, "notes": "Poured on time, no issues" }
     ```
-    If omitted, outcome is auto-derived: `succeeded` unless the concrete load
-    had already expired (`load_status == 'expired'`).
+    If omitted, outcome is derived from the actual timer at completion.
+    Success for an expired load requires non-blank notes and is flagged for review.
+    Only in-progress or paused trips can be completed.
+    Completion beyond 100 metres from the site is allowed but flagged for review.
+    A missing current location is also flagged for review.
     """
     try:
         return await trip_service.complete_trip(trip_id, req)
@@ -220,7 +227,7 @@ async def delete_trip(
     trip_id: int,
     trip_service: TripService = Depends(get_trip_service),
 ) -> None:
-    """Hard-delete a trip. Only cancelled or completed trips can be deleted."""
+    """Archive a terminal trip without deleting its row or event history."""
     try:
         trip_service.delete_trip(trip_id)
     except ValueError as e:
@@ -295,7 +302,10 @@ async def begin_trip(
 
 
 @router.get("/{trip_id}/stream")
-async def stream_trip_events(trip_id: int):
+async def stream_trip_events(
+    trip_id: int,
+    trip_service: TripService = Depends(get_trip_service),
+):
     """
     Server-Sent Events stream for real-time trip updates.
 
@@ -313,6 +323,10 @@ async def stream_trip_events(trip_id: int):
         // data.new_polyline, data.reason, data.new_steps, ...
       });
     """
+    # Authenticate and confirm tenant ownership before registering a subscriber.
+    # EventSource cannot attach a bearer header; clients should consume this route
+    # with fetch() and the Clerk session token.
+    trip_service.get_trip(trip_id)
     queue = subscribe_trip(trip_id)
 
     async def event_generator():

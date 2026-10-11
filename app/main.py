@@ -10,7 +10,10 @@ from fastapi.responses import JSONResponse
 
 from app.api.v1 import api_router
 from app.config import settings
-from app.db import Base, engine
+from app.db import Base, engine, migrate_auth_schema
+from app.db.catalogue_migration import migrate_catalogue
+from app.db.business_migration import migrate_business_schema
+from app.db.geography_migration import migrate_geography
 from app.services.google_maps import GoogleMapsService
 from app.services.traffic_monitor import start_traffic_monitor, stop_traffic_monitor
 from app.dependencies import get_google_maps_client, get_load_manager, get_alert_service
@@ -68,12 +71,17 @@ async def lifespan(app: FastAPI):
     """Application lifespan context manager"""
     # Startup
     logger.info("Starting RMC Delivery Route Optimizer API")
-    # Create tables
+    # Create existing operational tables and run the versioned catalogue import.
     try:
+        migrate_geography(engine)
         Base.metadata.create_all(bind=engine)
+        migrate_business_schema(engine)
+        migrate_catalogue(engine)
+        migrate_auth_schema(engine)
         logger.info("Database tables created successfully")
     except Exception as e:
         logger.error(f"Error creating database tables: {e}")
+        raise
 
     # Start background traffic monitor for active trips
     try:

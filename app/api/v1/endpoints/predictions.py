@@ -103,13 +103,13 @@ class NearestPlantRequest(BaseModel):
         le=20,
         description="How many nearest plants to return (default 5, max 20)",
     )
-    brand: Optional[str] = Field(
+    brand_id: Optional[str] = Field(
         default=None,
-        description="Filter to a specific brand  e.g. 'Holcim' | 'Allied' | 'Firth'",
+        description="Filter to a catalogue brand ID.",
     )
-    region: Optional[str] = Field(
+    region_id: Optional[str] = Field(
         default=None,
-        description="Filter to a region  e.g. 'South Auckland' | 'North Shore'",
+        description="Filter to a catalogue region ID.",
     )
 
 
@@ -253,13 +253,13 @@ async def nearest_plant(
         raise HTTPException(status_code=400, detail=f"Could not geocode address: {e}")
 
     try:
-        locator = PlantLocator()
+        locator = service._locator
         plants = locator.nearest_by_distance(
             lat=job_geo["latitude"],
             lng=job_geo["longitude"],
             top_n=req.top_n,
-            brand=req.brand,
-            region=req.region,
+            brand_id=req.brand_id,
+            region=req.region_id,
         )
         return {
             "job_site":          req.job_site_address,

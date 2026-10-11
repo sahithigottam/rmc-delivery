@@ -20,6 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Dict, List, Optional, Set
 
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.models import Route, Trip, TripEvent
@@ -42,6 +43,7 @@ from app.schemas import (
 )
 from app.services.google_maps import GoogleMapsService
 from app.services.route import RouteService
+from app.utils.time import as_utc
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,7 @@ MIN_REMAINING_KM_FOR_CHECK = 1.0         # don't bother checking if < 1km left
 REROUTE_COOLDOWN_SECONDS = 180           # don't reroute more than once per 3 min
 TRAFFIC_CHECK_MIN_MOVEMENT_KM = 0.2      # skip Directions call if truck moved < 200m since last check
 TRAFFIC_CHECK_MAX_SKIP_SECONDS = 480     # always call API after 8 min regardless of movement
+COMPLETION_RADIUS_METERS = 100.0
 
 # ── Per-trip position tracking for API call deduplication ─────────────────
 # Maps trip_id → (lat, lng) at the time of the last successful Directions call.
@@ -105,19 +108,41 @@ class TripService:
         google_maps: GoogleMapsService,
         load_manager: Optional[LoadManager] = None,
         alert_service: Optional[AlertService] = None,
+        organization_id: Optional[str] = None,
+        actor_user_id: Optional[str] = None,
+        is_super_admin: bool = False,
     ):
         self.db = db
         self.google_maps = google_maps
         self._load_manager = load_manager or LoadManager()
         self._alerts = alert_service
+        self.organization_id = organization_id
+        self.actor_user_id = actor_user_id
+        self.is_super_admin = is_super_admin
 
     # ── Trip lifecycle ─────────────────────────────────────────────────
 
     async def start_trip(self, req: TripStart) -> TripResponse:
         """Start a new trip from a previously calculated route."""
-        route = self.db.query(Route).filter(Route.id == req.route_id).first()
+        route_query = self.db.query(Route).filter(Route.id == req.route_id)
+        route = route_query.first()
+        if route is not None and self.organization_id is not None:
+            if route.organization_id != self.organization_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cannot operate on another organization's route",
+                )
+        if self.organization_id is not None:
+            route_query = route_query.filter(Route.organization_id == self.organization_id)
+        route = route_query.first()
         if not route:
             raise ValueError(f"Route {req.route_id} not found")
+        if req.plant_id is not None and self.organization_id is not None:
+            plant = PlantLocator(self.db, organization_id=self.organization_id).get_by_id(req.plant_id)
+            if plant is None:
+                raise HTTPException(status_code=403, detail="Plant does not belong to the active business")
+            if not plant["active"]:
+                raise ValueError("Inactive plants cannot start new trips")
 
         # ── RMC: resolve batch time + concrete spec ──
         batch_time = req.batch_time or datetime.now(timezone.utc)
@@ -136,8 +161,11 @@ class TripService:
 
         # Create load timer
         load_timer = self._load_manager.start_timer(batch_time, spec)
+        self._validate_batch_timer(load_timer)
 
         trip = Trip(
+            organization_id=self.organization_id,
+            created_by_user_id=self.actor_user_id,
             route_id=route.id,
             status="in_progress",
             start_address=route.resolved_start_address or route.start_address,
@@ -162,13 +190,13 @@ class TripService:
             # RMC fields
             batch_time=batch_time,
             load_expiry_time=load_timer.expiry_time,
-            load_status=LoadStatus.FRESH.value,
+            load_status=load_timer.status.value,
             mix_code=spec.mix_code,
             concrete_grade=spec.grade.value,
             volume_m3=spec.volume_m3,
             retarder_added=spec.requires_retarder,
             retarder_extension_minutes=load_timer.retarder_extension_minutes,
-            load_max_life_minutes=load_timer.effective_max_minutes,
+            load_max_life_minutes=load_timer.max_life_minutes,
             plant_id=req.plant_id,
             pour_duration_minutes=req.pour_duration_minutes,
         )
@@ -193,7 +221,8 @@ class TripService:
             "mix_code": spec.mix_code,
             "volume_m3": spec.volume_m3,
             "load_expiry_time": load_timer.expiry_time.isoformat(),
-            "load_max_life_minutes": load_timer.effective_max_minutes,
+            "load_max_life_minutes": load_timer.max_life_minutes,
+            "effective_max_minutes": load_timer.effective_max_minutes,
         }, lat=route.start_lat, lng=route.start_lng)
 
         # Publish load_batched event via alert service
@@ -211,9 +240,35 @@ class TripService:
 
     async def update_position(self, trip_id: int, pos: PositionUpdate) -> TripResponse:
         """Update truck's GPS position and estimate remaining distance."""
-        trip = self._get_trip(trip_id)
+        trip = (
+            self.db.query(Trip).filter(Trip.id == trip_id)
+            .populate_existing().with_for_update().first()
+        )
+        if trip is None:
+            raise ValueError(f"Trip {trip_id} not found")
+        self._get_trip(trip_id)
         if trip.status not in ("in_progress", "paused"):
             raise ValueError(f"Cannot update position for trip in '{trip.status}' state")
+
+        received_at = datetime.now(timezone.utc)
+        captured_at = pos.captured_at or received_at
+        previous_at = self._latest_position_time(trip_id)
+        rejection_reason = None
+        if captured_at > received_at:
+            rejection_reason = "GPS captured_at cannot be in the future."
+        elif previous_at is not None and captured_at <= previous_at:
+            rejection_reason = "GPS report is stale or duplicated; captured_at must be newer than the last accepted position."
+        if rejection_reason:
+            self._log_event(trip_id, "position_rejected", {
+                "lat": pos.lat,
+                "lng": pos.lng,
+                "captured_at": captured_at.isoformat(),
+                "received_at": received_at.isoformat(),
+                "reason": rejection_reason,
+            }, lat=pos.lat, lng=pos.lng)
+            self.db.commit()
+            logger.warning("Trip %s position rejected: %s", trip_id, rejection_reason)
+            raise ValueError(rejection_reason)
 
         trip.current_lat = pos.lat
         trip.current_lng = pos.lng
@@ -224,17 +279,17 @@ class TripService:
         remaining_km = self._haversine(pos.lat, pos.lng, trip.end_lat, trip.end_lng)
         trip.remaining_distance_meters = remaining_km * 1000
 
-        # Log position (throttled — only if moved >100m from last logged position)
         self._log_event(trip.id, "position_update", {
             "lat": pos.lat,
             "lng": pos.lng,
             "heading": pos.heading,
             "speed_kmh": pos.speed_kmh,
             "remaining_km": round(remaining_km, 2),
+            "captured_at": captured_at.isoformat(),
+            "received_at": received_at.isoformat(),
         }, lat=pos.lat, lng=pos.lng)
 
-        # Auto-complete if very close to destination (<200m)
-        if remaining_km < 0.2:
+        if remaining_km * 1000 <= COMPLETION_RADIUS_METERS:
             return await self._complete_trip(trip, auto=True)
 
         self.db.commit()
@@ -244,6 +299,8 @@ class TripService:
         await _push_event(trip_id, "position", {
             "lat": pos.lat, "lng": pos.lng,
             "remaining_km": round(remaining_km, 2),
+            "captured_at": captured_at.isoformat(),
+            "received_at": received_at.isoformat(),
         })
 
         return self._to_response(trip)
@@ -296,17 +353,14 @@ class TripService:
         Otherwise auto-derive: load still within time window → succeeded.
         """
         trip = self._get_trip(trip_id)
+        if trip.status in ("completed", "cancelled"):
+            raise ValueError(f"Trip already {trip.status}")
 
-        # Determine outcome
-        if req is not None and req.success is not None:
-            outcome = "succeeded" if req.success else "failed"
-        else:
-            # Auto-derive from load status
-            outcome = "failed" if trip.load_status == LoadStatus.EXPIRED.value else "succeeded"
-
-        trip.outcome = outcome
         notes = req.notes if req is not None else None
-        return await self._complete_trip(trip, auto=False, notes=notes)
+        return await self._complete_trip(
+            trip, auto=False, notes=notes,
+            reported_success=req.success if req is not None else None,
+        )
 
     # ── Dispatch lifecycle ──────────────────────────────────────────────
 
@@ -330,10 +384,14 @@ class TripService:
         from app.schemas import DispatchResponse, RouteCreate, LocationRequest
         from app.services.plant_locator import PlantLocator
 
-        loc = PlantLocator()
+        loc = PlantLocator(self.db, organization_id=self.organization_id)
         plant = loc.get_by_id(req.plant_id)
         if not plant:
             raise ValueError(f"Plant '{req.plant_id}' not found in plants catalogue")
+        if not plant.get("active", True):
+            raise ValueError(f"Plant '{req.plant_id}' is inactive and cannot be dispatched")
+        if req.concrete_mix not in plant.get("supported_mix_codes", ["GP", "HE", "RE"]):
+            raise ValueError(f"Plant '{req.plant_id}' does not support mix '{req.concrete_mix}'")
 
         # Build and calculate route
         route_req = RouteCreate(
@@ -343,16 +401,28 @@ class TripService:
             departure_datetime=req.scheduled_at,
         )
         route_resp = await route_service.estimate_route(route_req)
-        route = self.db.query(Route).filter(Route.id == route_resp.id).first()
+        route_query = self.db.query(Route).filter(Route.id == route_resp.id)
+        if self.organization_id is not None:
+            route_query = route_query.filter(Route.organization_id == self.organization_id)
+        route = route_query.first()
         if not route:
             raise ValueError("Route could not be saved to database")
 
         # Serialize prediction snapshot if provided
         pred_json: Optional[str] = None
-        if req.prediction_snapshot:
-            pred_json = _json.dumps(req.prediction_snapshot)
+        snapshot = dict(req.prediction_snapshot or {})
+        snapshot["catalogue_snapshot"] = {
+            key: plant[key] for key in (
+                "id", "name", "brand_id", "brand", "region_id", "address",
+                "lat", "lng", "country_code", "timezone", "calibration_status",
+                "supported_mix_codes", "version", "brand_version", "region_version",
+            )
+        }
+        pred_json = _json.dumps(snapshot)
 
         trip = Trip(
+            organization_id=self.organization_id,
+            created_by_user_id=self.actor_user_id,
             route_id=route.id,
             status="pending",
             start_address=route.resolved_start_address or route.start_address,
@@ -445,18 +515,19 @@ class TripService:
             requires_retarder=req.requires_retarder,
         )
         load_timer = self._load_manager.start_timer(batch_time, spec)
+        self._validate_batch_timer(load_timer)
 
         trip.status = "in_progress"
         trip.started_at = datetime.now(timezone.utc)
         trip.batch_time = batch_time
         trip.load_expiry_time = load_timer.expiry_time
-        trip.load_status = LoadStatus.FRESH.value
+        trip.load_status = load_timer.status.value
         trip.mix_code = req.mix_code or spec.mix_code
         trip.concrete_grade = grade.value
         trip.volume_m3 = spec.volume_m3
         trip.retarder_added = spec.requires_retarder
         trip.retarder_extension_minutes = load_timer.retarder_extension_minutes
-        trip.load_max_life_minutes = load_timer.effective_max_minutes
+        trip.load_max_life_minutes = load_timer.max_life_minutes
 
         if trip.original_duration_seconds:
             trip.estimated_arrival = datetime.now(timezone.utc) + timedelta(
@@ -468,7 +539,8 @@ class TripService:
             "mix_code": spec.mix_code,
             "volume_m3": spec.volume_m3,
             "load_expiry_time": load_timer.expiry_time.isoformat(),
-            "load_max_life_minutes": load_timer.effective_max_minutes,
+            "load_max_life_minutes": load_timer.max_life_minutes,
+            "effective_max_minutes": load_timer.effective_max_minutes,
         }, lat=trip.current_lat, lng=trip.current_lng)
 
         if self._alerts:
@@ -490,38 +562,40 @@ class TripService:
         return self._to_response(trip)
 
     def get_active_trips(self) -> List[TripResponse]:
-        trips = (
-            self.db.query(Trip)
-            .filter(Trip.status.in_(["in_progress", "paused", "pending"]))
-            .order_by(Trip.created_at.desc())
-            .all()
+        query = self.db.query(Trip).filter(
+            Trip.status.in_(["in_progress", "paused", "pending"]),
+            Trip.archived_at.is_(None),
         )
+        if self.organization_id is not None:
+            query = query.filter(Trip.organization_id == self.organization_id)
+        trips = query.order_by(Trip.created_at.desc()).all()
         return [self._to_response(t) for t in trips]
 
     def get_all_trips(self, limit: int = 100) -> List[TripResponse]:
-        trips = (
-            self.db.query(Trip)
-            .order_by(Trip.created_at.desc())
-            .limit(limit)
-            .all()
-        )
+        query = self.db.query(Trip).filter(Trip.archived_at.is_(None))
+        if self.organization_id is not None:
+            query = query.filter(Trip.organization_id == self.organization_id)
+        trips = query.order_by(Trip.created_at.desc()).limit(limit).all()
         return [self._to_response(t) for t in trips]
 
     def delete_trip(self, trip_id: int) -> None:
-        """Hard-delete a trip. Only allowed for cancelled or completed trips."""
+        """Archive a terminal trip while preserving its row and audit history."""
         trip = self._get_trip(trip_id)
         if trip.status not in ("cancelled", "completed"):
             raise ValueError(
                 f"Cannot delete trip in '{trip.status}' state. "
                 "Only cancelled or completed trips can be deleted."
             )
-        # Delete associated events first (cascade safety)
-        self.db.query(TripEvent).filter(TripEvent.trip_id == trip_id).delete()
-        self.db.delete(trip)
+        trip.archived_at = datetime.now(timezone.utc)
+        trip.archived_by_user_id = self.actor_user_id
+        self._log_event(trip_id, "trip_archived", {
+            "reason": "operator_archived_terminal_trip",
+        })
         self.db.commit()
-        logger.info(f"Trip {trip_id} deleted.")
+        logger.info("Trip %s archived by %s", trip_id, self.actor_user_id)
 
     def get_trip_events(self, trip_id: int, limit: int = 50) -> List[TripEventResponse]:
+        self._get_trip(trip_id)
         events = (
             self.db.query(TripEvent)
             .filter(TripEvent.trip_id == trip_id)
@@ -557,7 +631,7 @@ class TripService:
 
         # Cooldown check
         if trip.last_reroute_at:
-            elapsed = (datetime.now(timezone.utc) - trip.last_reroute_at.replace(tzinfo=timezone.utc)).total_seconds()
+            elapsed = (datetime.now(timezone.utc) - as_utc(trip.last_reroute_at)).total_seconds()
             if elapsed < REROUTE_COOLDOWN_SECONDS:
                 return None
 
@@ -572,7 +646,7 @@ class TripService:
             moved_km = self._haversine(prev[0], prev[1], current_lat, current_lng)
             time_since_s = (
                 datetime.now(timezone.utc)
-                - trip.last_traffic_check_at.replace(tzinfo=timezone.utc)
+                - as_utc(trip.last_traffic_check_at)
             ).total_seconds()
             if moved_km < TRAFFIC_CHECK_MIN_MOVEMENT_KM and time_since_s < TRAFFIC_CHECK_MAX_SKIP_SECONDS:
                 logger.debug(
@@ -754,14 +828,63 @@ class TripService:
     # ── Internal helpers ───────────────────────────────────────────────
 
     def _get_trip(self, trip_id: int) -> Trip:
-        trip = self.db.query(Trip).filter(Trip.id == trip_id).first()
-        if not trip:
+        query = self.db.query(Trip).filter(Trip.id == trip_id)
+        trip = query.first()
+        if trip is None or trip.archived_at is not None:
             raise ValueError(f"Trip {trip_id} not found")
+        if self.organization_id is not None:
+            if trip.organization_id is None:
+                raise ValueError(f"Trip {trip_id} not found")
+            if trip.organization_id != self.organization_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cannot access or modify another organization's trip",
+                )
         return trip
 
     async def _complete_trip(
-        self, trip: Trip, auto: bool = False, notes: Optional[str] = None
+        self, trip: Trip, auto: bool = False, notes: Optional[str] = None,
+        reported_success: Optional[bool] = None,
     ) -> TripResponse:
+        if trip.status in ("completed", "cancelled"):
+            raise ValueError(f"Trip already {trip.status}")
+        if trip.status not in ("in_progress", "paused"):
+            raise ValueError("Only in-progress or paused trips can be completed")
+        timer = self._load_timer(trip) if trip.batch_time else None
+        actual_status = timer.status.value if timer is not None else trip.load_status
+        expired = actual_status == LoadStatus.EXPIRED.value
+        expiry_override = expired and reported_success is True
+        if expiry_override and (not notes or not notes.strip()):
+            logger.warning("Trip %s expired-load success override rejected without a reason", trip.id)
+            raise ValueError("A non-blank notes reason is required to report success for an expired load")
+        if timer is not None:
+            trip.load_status = actual_status
+        if reported_success is not None:
+            trip.outcome = "succeeded" if reported_success else "failed"
+        else:
+            trip.outcome = "failed" if expired else "succeeded"
+        distance_meters = None
+        if trip.current_lat is not None and trip.current_lng is not None:
+            distance_meters = self._haversine(
+                trip.current_lat, trip.current_lng, trip.end_lat, trip.end_lng,
+            ) * 1000
+        review_required = (
+            distance_meters is None or distance_meters > COMPLETION_RADIUS_METERS
+        )
+        review_reason = None
+        if distance_meters is None:
+            review_reason = "Completion location is unavailable."
+        elif review_required:
+            review_reason = "Completion location is more than 100 metres from the site."
+        if expiry_override:
+            review_required = True
+            override_reason = "Success was reported for an actually expired load; operator review is required."
+            review_reason = f"{review_reason} {override_reason}" if review_reason else override_reason
+        if review_required:
+            logger.warning(
+                "Trip %s completion flagged for review: %s Distance: %s metres",
+                trip.id, review_reason, distance_meters,
+            )
         trip.status = "completed"
         trip.completed_at = datetime.now(timezone.utc)
         trip.remaining_distance_meters = 0
@@ -772,14 +895,28 @@ class TripService:
             "outcome": trip.outcome,
             "final_lat": trip.current_lat,
             "final_lng": trip.current_lng,
+            "completion_distance_meters": distance_meters,
+            "completion_radius_meters": COMPLETION_RADIUS_METERS,
+            "completion_review_required": review_required,
+            "completion_review_reason": review_reason,
+            "actual_load_status": actual_status,
+            "expiry_override": expiry_override,
+            "reported_success": reported_success,
         }
+        if timer is not None:
+            event_data["load_timer"] = timer.snapshot()
         if notes:
             event_data["notes"] = notes
         self._log_event(trip.id, "trip_completed", event_data,
                         lat=trip.current_lat, lng=trip.current_lng)
         self.db.commit()
         self.db.refresh(trip)
-        await _push_event(trip.id, "status", {"status": "completed"})
+        await _push_event(trip.id, "status", {
+            "status": "completed",
+            "completion_distance_meters": distance_meters,
+            "completion_review_required": review_required,
+            "completion_review_reason": review_reason,
+        })
         logger.info(f"🏁 Trip {trip.id} completed (reroutes: {trip.reroute_count})")
         return self._to_response(trip)
 
@@ -787,6 +924,7 @@ class TripService:
                    lat: Optional[float] = None, lng: Optional[float] = None):
         event = TripEvent(
             trip_id=trip_id,
+            actor_user_id=self.actor_user_id,
             event_type=event_type,
             data=data,
             lat=lat,
@@ -807,13 +945,7 @@ class TripService:
         if not trip.batch_time:
             return  # no load timer — legacy trip without RMC data
 
-        # Reconstruct LoadTimer from persisted state
-        timer = LoadTimer(
-            batch_time=trip.batch_time,
-            max_life_minutes=trip.load_max_life_minutes or 90,
-            retarder_added=bool(trip.retarder_added),
-            retarder_extension_minutes=trip.retarder_extension_minutes or 0,
-        )
+        timer = self._load_timer(trip)
 
         previous_status_str = trip.load_status or "fresh"
         try:
@@ -830,7 +962,7 @@ class TripService:
         )
 
         # Update persisted load status
-        new_status = self._load_manager.check_status(timer, eta_minutes)
+        new_status = self._load_manager.check_status(timer, current_eta_minutes=eta_minutes)
         trip.load_status = new_status.value
 
         # Log load timer snapshot as event
@@ -845,6 +977,19 @@ class TripService:
             await self._alerts.publish_all(events)
 
     def _to_response(self, trip: Trip) -> TripResponse:
+        completion_data = {}
+        if trip.status == "completed":
+            completion_event = (
+                self.db.query(TripEvent)
+                .filter(
+                    TripEvent.trip_id == trip.id,
+                    TripEvent.event_type == "trip_completed",
+                )
+                .order_by(TripEvent.created_at.desc(), TripEvent.id.desc())
+                .first()
+            )
+            if completion_event is not None:
+                completion_data = completion_event.data or {}
         # Get last 20 events
         recent = (
             self.db.query(TripEvent)
@@ -860,6 +1005,7 @@ class TripService:
             current_lat=trip.current_lat,
             current_lng=trip.current_lng,
             heading=trip.heading,
+            current_position_at=self._latest_position_time(trip.id),
             start_address=trip.start_address,
             end_address=trip.end_address,
             start_lat=trip.start_lat,
@@ -889,7 +1035,10 @@ class TripService:
             volume_m3=trip.volume_m3,
             retarder_added=bool(trip.retarder_added) if trip.retarder_added else False,
             retarder_extension_minutes=trip.retarder_extension_minutes or 0,
-            load_max_life_minutes=trip.load_max_life_minutes or 90,
+            load_max_life_minutes=(
+                self._load_timer(trip).max_life_minutes
+                if trip.batch_time else trip.load_max_life_minutes or 90
+            ),
             load_minutes_remaining=self._calc_load_remaining(trip),
             plant_id=trip.plant_id,
             pour_duration_minutes=trip.pour_duration_minutes,
@@ -897,6 +1046,9 @@ class TripService:
             scheduled_at=trip.scheduled_at,
             concrete_mix=trip.concrete_mix,
             outcome=trip.outcome,
+            completion_distance_meters=completion_data.get("completion_distance_meters"),
+            completion_review_required=completion_data.get("completion_review_required"),
+            completion_review_reason=completion_data.get("completion_review_reason"),
             # Timestamps
             started_at=trip.started_at,
             completed_at=trip.completed_at,
@@ -905,19 +1057,59 @@ class TripService:
             recent_events=[TripEventResponse.model_validate(e) for e in recent],
         )
 
+    def _latest_position_time(self, trip_id: int) -> Optional[datetime]:
+        event = (
+            self.db.query(TripEvent)
+            .filter(TripEvent.trip_id == trip_id, TripEvent.event_type == "position_update")
+            .order_by(TripEvent.id.desc())
+            .first()
+        )
+        if event is None:
+            return None
+        captured_at = (event.data or {}).get("captured_at")
+        value = datetime.fromisoformat(captured_at) if captured_at else event.created_at
+        return as_utc(value)
+
+    @staticmethod
+    def _validate_batch_timer(timer: LoadTimer) -> None:
+        if as_utc(timer.batch_time) > datetime.now(timezone.utc):
+            logger.warning("Rejected batch time in the future: %s", timer.batch_time)
+            raise ValueError("Batch time cannot be in the future")
+        if timer.is_expired:
+            logger.warning("Rejected already-expired batch: %s", timer.batch_time)
+            raise ValueError("Cannot start a trip with an already-expired concrete load")
+
+    @staticmethod
+    def _load_timer(trip: Trip) -> LoadTimer:
+        base_minutes = trip.load_max_life_minutes or 90
+        extension = trip.retarder_extension_minutes or 0
+        if trip.retarder_added and extension and trip.load_expiry_time:
+            stored_window = (
+                as_utc(trip.load_expiry_time) - as_utc(trip.batch_time)
+            ).total_seconds() / 60
+            # Older trips stored the extended limit in the base-life column.
+            if abs(stored_window - base_minutes) < 0.001:
+                base_minutes -= extension
+                logger.warning(
+                    "Trip %s: reading legacy extended life as base %s + extension %s",
+                    trip.id, base_minutes, extension,
+                )
+        high_grade = trip.concrete_grade in {grade.value for grade in ConcreteSpec.HIGH_STRENGTH_GRADES}
+        return LoadTimer(
+            batch_time=as_utc(trip.batch_time),
+            max_life_minutes=base_minutes,
+            warning_at_minutes=45 if high_grade else 60,
+            critical_at_minutes=60 if high_grade else 75,
+            retarder_added=bool(trip.retarder_added),
+            retarder_extension_minutes=extension,
+        )
+
     @staticmethod
     def _calc_load_remaining(trip: Trip) -> Optional[float]:
-        """Calculate minutes remaining on the load timer (live, not persisted)."""
+        """Calculate minutes remaining with the same timer used for monitoring."""
         if not trip.batch_time:
             return None
-        batch_utc = trip.batch_time
-        if batch_utc.tzinfo is None:
-            batch_utc = batch_utc.replace(tzinfo=timezone.utc)
-        max_life = (trip.load_max_life_minutes or 90)
-        if trip.retarder_added:
-            max_life += (trip.retarder_extension_minutes or 0)
-        elapsed = (datetime.now(timezone.utc) - batch_utc).total_seconds() / 60.0
-        return round(max_life - elapsed, 1)
+        return round(TripService._load_timer(trip).minutes_remaining, 1)
 
     @staticmethod
     def _haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:

@@ -91,10 +91,12 @@ class GoogleMapsService:
         key_string = "|".join(key_parts)
         return hashlib.md5(key_string.encode()).hexdigest()
 
-    def _get_geocode_cache_key(self, address: str) -> str:
+    def _get_geocode_cache_key(self, address: str, country_code: Optional[str] = None) -> str:
         """Generate a cache key for geocode request"""
         # Normalize address for better cache hits
         normalized = address.lower().strip()
+        if country_code:
+            normalized += f"|country:{country_code.upper()}"
         return hashlib.md5(normalized.encode()).hexdigest()
 
     def get_cache_stats(self) -> Dict:
@@ -181,8 +183,8 @@ class GoogleMapsService:
             response.raise_for_status()
             result = response.json()
             
-            # Cache the result
-            self._directions_cache[cache_key] = result
+            if result.get("status") == "OK":
+                self._directions_cache[cache_key] = result
             
             return result
 
@@ -193,19 +195,20 @@ class GoogleMapsService:
             logger.error(f"Error calling Google Directions API: {e}")
             raise
 
-    async def geocode_address(self, address: str) -> dict:
+    async def geocode_address(self, address: str, country_code: Optional[str] = None) -> dict:
         """
         Geocode an address to coordinates using Google Geocoding API.
         Results are cached for 24 hours.
 
         Args:
             address: Street address or location name
+            country_code: Optional ISO country restriction (e.g. IN or NZ)
 
         Returns:
             Dictionary with latitude, longitude, and formatted address
         """
         # Check cache first
-        cache_key = self._get_geocode_cache_key(address)
+        cache_key = self._get_geocode_cache_key(address, country_code)
         
         if cache_key in self._geocode_cache:
             self._cache_stats["geocode_hits"] += 1
@@ -221,16 +224,23 @@ class GoogleMapsService:
             params = {
                 "address": address,
                 "key": self.api_key,
-                "components": "country:NZ",  # Restrict to New Zealand
             }
+            if country_code:
+                params["components"] = f"country:{country_code.upper()}"
 
             response = await self.client.get(url, params=params)
             response.raise_for_status()
             data = response.json()
 
             if data.get("status") != "OK" or not data.get("results"):
-                logger.error(f"Geocoding failed for address: {address}. Response: {data}")
-                raise ValueError(f"Could not geocode address: {address}")
+                error = (
+                    f"Could not geocode address: {address} "
+                    f"(status: {data.get('status', 'unknown')})"
+                )
+                if data.get("error_message"):
+                    error += f": {data['error_message']}"
+                logger.error(error)
+                raise ValueError(error)
 
             result = data["results"][0]
             location = result["geometry"]["location"]

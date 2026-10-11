@@ -1,5 +1,6 @@
 """Application configuration settings"""
 import logging
+import json
 from pathlib import Path
 from pydantic_settings import BaseSettings
 
@@ -20,11 +21,23 @@ class Settings(BaseSettings):
     # Google Maps API
     google_maps_api_key: str = ""
 
+    # LLM for risk narratives: ollama (default) | openrouter | gemini. Keys belong in .env only.
+    llm_provider: str = "ollama"
+    llm_model: str = ""  # empty = provider default
+    openrouter_api_key: str = ""
+    gemini_api_key: str = ""
+
     # FastAPI
     log_level: str = "INFO"
     api_v1_prefix: str = "/api/v1"
     api_title: str = "RMC Delivery Route Optimizer"
     api_version: str = "1.0.0"
+
+    # Clerk authentication. These are public verification settings, not API secrets.
+    clerk_jwks_url: str = ""
+    clerk_issuer: str = ""
+    clerk_authorized_parties: str = ""
+    super_admin_user_id: str = ""  # Semicolon-separated verified Clerk user IDs.
 
     # Rate Limiting
     rate_limit_requests: int = 100
@@ -36,35 +49,36 @@ class Settings(BaseSettings):
 
 
 def load_settings() -> Settings:
-    """Load settings with credentials.json priority"""
+    """Load settings, using credentials.json only to fill missing values."""
     settings = Settings()
 
-    # Try to load from credentials.json if it exists
+    # Try to load from credentials.json if it exists.
+    # Environment variables stay authoritative for deploy targets like Cloud Run.
     credentials_file = Path(__file__).parent.parent / "config" / "credentials.json"
 
     if credentials_file.exists():
         try:
-            import json
-
             with open(credentials_file, "r") as f:
                 creds = json.load(f)
 
-            # Load debug setting
-            if "debug" in creds:
+            # Load debug setting only if it was not set explicitly via env.
+            if "debug" in creds and "DEBUG" not in settings.model_fields_set:
                 settings.debug = creds.get("debug", False)
                 logger.info(f"Debug mode: {settings.debug}")
 
-            # Load Google Maps API key from credentials.json
-            google_key = (
-                creds.get("google_maps", {}).get("api_key") or settings.google_maps_api_key
-            )
-            if google_key and google_key != "YOUR_GOOGLE_MAPS_API_KEY_HERE":
+            # Load Google Maps API key from credentials.json only if env left it empty.
+            google_key = creds.get("google_maps", {}).get("api_key")
+            if (
+                not settings.google_maps_api_key
+                and google_key
+                and google_key != "YOUR_GOOGLE_MAPS_API_KEY_HERE"
+            ):
                 settings.google_maps_api_key = google_key
                 logger.info("Google Maps API key loaded from config/credentials.json")
 
-            # Load database URL from credentials.json
+            # Load database URL from credentials.json only if env left the default in place.
             db_config = creds.get("database", {})
-            if db_config:
+            if db_config and settings.database_url == Settings.model_fields["database_url"].default:
                 db_type = db_config.get("type", "sqlite")
                 
                 if db_type == "sqlite":

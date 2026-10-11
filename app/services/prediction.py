@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+from sqlalchemy.orm import Session
 
 from app.rmc.predictor import DeliveryPredictor, DeliveryPrediction
 from app.services.google_maps import GoogleMapsService
@@ -42,11 +43,20 @@ class PredictionService:
     WeatherService and LLMAnalyzer are lightweight and created internally.
     """
 
-    def __init__(self, google_maps: GoogleMapsService):
+    def __init__(
+        self,
+        google_maps: GoogleMapsService,
+        db: Optional[Session] = None,
+        organization_id: Optional[str] = None,
+    ):
         self._gmaps     = google_maps
         self._weather   = WeatherService()
         self._predictor = DeliveryPredictor()    # uses NZTA baselines
         self._llm       = LLMAnalyzer()
+        self._locator   = PlantLocator(db, organization_id=organization_id)
+
+    async def geocode_job_site(self, address: str, country_code: str) -> dict:
+        return await self._gmaps.geocode_address(address, country_code=country_code)
 
     async def predict_delivery(
         self,
@@ -54,6 +64,7 @@ class PredictionService:
         end_address: str,
         concrete_mix: str = "GP",
         include_llm: bool = True,
+        country_code: Optional[str] = None,
     ) -> dict:
         """
         Full pre-trip prediction pipeline.
@@ -63,6 +74,7 @@ class PredictionService:
             end_address   : Job site address e.g. "45 Queen Street, Auckland CBD"
             concrete_mix  : "GP" (90 min) | "HE" (60 min) | "RE" (120 min)
             include_llm   : Set False to skip Ollama call (faster, no narrative)
+            country_code  : Optional ISO country restriction for both addresses
 
         Returns:
             Full prediction report dict. Shape is always identical regardless
@@ -77,8 +89,8 @@ class PredictionService:
         logger.info(f"Prediction request: {start_address[:40]} → {end_address[:40]}")
         try:
             # Geocode both addresses first
-            start_geo = await self._gmaps.geocode_address(start_address)
-            end_geo   = await self._gmaps.geocode_address(end_address)
+            start_geo = await self._gmaps.geocode_address(start_address, country_code=country_code)
+            end_geo   = await self._gmaps.geocode_address(end_address, country_code=country_code)
 
             directions = await self._gmaps.get_directions(
                 start_lat=start_geo["latitude"],
@@ -94,13 +106,15 @@ class PredictionService:
             return {"error": f"Google Directions API failed: {e}"}
 
         if not directions or directions.get("status") != "OK":
-            return {
-                "error": (
-                    f"Google Directions returned no results "
-                    f"(status: {directions.get('status') if directions else 'no response'}). "
-                    f"Check addresses."
-                )
-            }
+            error = (
+                f"Google Directions returned no results "
+                f"(status: {directions.get('status') if directions else 'no response'}). "
+                f"Check addresses."
+            )
+            if directions and directions.get("error_message"):
+                error += f" {directions['error_message']}"
+            logger.error(error)
+            return {"error": error}
 
         route = directions["routes"][0]
         leg   = route["legs"][0]
@@ -233,12 +247,13 @@ class PredictionService:
             return {"error": f"Could not geocode job site: {e}"}
 
         concrete_limit = MIX_LIMITS.get(concrete_mix.upper(), 90)
-        locator = PlantLocator()
+        locator = self._locator
         candidates = locator.candidates_for_job(
             job_lat=job_geo["latitude"],
             job_lng=job_geo["longitude"],
             concrete_limit_minutes=concrete_limit,
             top_n=top_n,
+            concrete_mix=concrete_mix,
         )
 
         if not candidates:

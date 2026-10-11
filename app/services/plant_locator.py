@@ -17,22 +17,20 @@ Why this matters:
   - Top 3 by distance → Google = 3 API calls ($0.015 per request)
   - Savings: 85% fewer Google calls, same accuracy
 
-Data source:
-  config/plants.json — real verified coordinates from Google Places API.
-  Static file, no API dependency, loads once at startup.
+Data source: the SQLite plant catalogue imported once from config/plants.json.
 """
 from __future__ import annotations
 
-import json
 import logging
 import math
-from pathlib import Path
 from typing import List, Optional
 
-logger = logging.getLogger(__name__)
+from sqlalchemy.orm import Session
+from app.db import SessionLocal
+from app.db.models import Brand, Plant, Region
+from app.services.catalogue import plant_dict
 
-# Path to plant data — always relative to repo root
-_PLANTS_JSON = Path(__file__).parent.parent.parent / "config" / "plants.json"
+logger = logging.getLogger(__name__)
 
 
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -57,7 +55,7 @@ class PlantLocator:
     """
     Finds the nearest concrete batching plants for a given job site.
 
-    Loads config/plants.json once on first use (lazy singleton pattern).
+    Reads the database catalogue without an in-memory singleton.
     All distance calculations run locally — zero API calls, zero cost.
 
     Usage:
@@ -76,30 +74,35 @@ class PlantLocator:
         allied = locator.get_by_brand("Allied")
     """
 
-    _plants: Optional[List[dict]] = None   # class-level cache — load once
+    def __init__(
+        self,
+        db: Optional[Session] = None,
+        organization_id: Optional[str] = None,
+    ):
+        self.db = db
+        self.organization_id = organization_id
 
-    def __init__(self):
-        if PlantLocator._plants is None:
-            PlantLocator._plants = self._load()
+    def _read(self, active_only: bool = True) -> List[dict]:
+        def query(db: Session) -> List[dict]:
+            records = db.query(Plant)
+            if self.organization_id is not None:
+                records = records.join(Brand, Brand.id == Plant.brand_id).join(Region, Region.id == Plant.region_id).filter(
+                    Plant.organization_id == self.organization_id,
+                    Brand.organization_id == self.organization_id,
+                    Region.organization_id == self.organization_id,
+                )
+            if active_only:
+                records = records.filter(Plant.active.is_(True))
+            return [plant_dict(p) for p in records.order_by(Plant.id).all()]
 
-    @staticmethod
-    def _load() -> List[dict]:
-        try:
-            with open(_PLANTS_JSON, encoding="utf-8") as f:
-                plants = json.load(f)
-            active = [p for p in plants if p.get("active", True)]
-            logger.info(f"PlantLocator: loaded {len(active)} active plants from {_PLANTS_JSON.name}")
-            return active
-        except FileNotFoundError:
-            logger.error(f"PlantLocator: {_PLANTS_JSON} not found")
-            return []
-        except json.JSONDecodeError as e:
-            logger.error(f"PlantLocator: invalid JSON in plants.json — {e}")
-            return []
+        if self.db is not None:
+            return query(self.db)
+        with SessionLocal() as db:
+            return query(db)
 
     @property
     def plants(self) -> List[dict]:
-        return PlantLocator._plants or []
+        return self._read()
 
     def nearest_by_distance(
         self,
@@ -108,6 +111,7 @@ class PlantLocator:
         top_n: Optional[int] = None,
         brand: Optional[str] = None,
         region: Optional[str] = None,
+        brand_id: Optional[str] = None,
     ) -> List[dict]:
         """
         Return plants sorted by straight-line distance to the job site.
@@ -134,6 +138,8 @@ class PlantLocator:
 
         if brand:
             candidates = [p for p in candidates if p.get("brand", "").lower() == brand.lower()]
+        if brand_id:
+            candidates = [p for p in candidates if p["brand_id"] == brand_id]
         if region:
             candidates = [p for p in candidates if p.get("region", "") == region]
 
@@ -148,7 +154,7 @@ class PlantLocator:
 
     def get_by_id(self, plant_id: str) -> Optional[dict]:
         """Get a plant by its unique ID."""
-        return next((p for p in self.plants if p["id"] == plant_id), None)
+        return next((p for p in self._read(active_only=False) if p["id"] == plant_id), None)
 
     def get_by_brand(self, brand: str) -> List[dict]:
         """Get all active plants for a specific brand."""
@@ -166,6 +172,7 @@ class PlantLocator:
         concrete_limit_minutes: int = 90,
         truck_speed_factor: float = 1.08,
         top_n: int = 5,
+        concrete_mix: Optional[str] = None,
     ) -> List[dict]:
         """
         Return the most viable plant candidates for a job site.
@@ -194,6 +201,8 @@ class PlantLocator:
         max_km = (max_rough_minutes / 60.0) * AVG_ROAD_SPEED_KMH / truck_speed_factor
 
         ranked = self.nearest_by_distance(job_lat, job_lng)
+        if concrete_mix:
+            ranked = [p for p in ranked if concrete_mix in p["supported_mix_codes"]]
         viable = [p for p in ranked if p["distance_km"] <= max_km]
 
         if not viable:

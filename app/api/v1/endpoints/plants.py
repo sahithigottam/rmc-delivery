@@ -1,381 +1,241 @@
-"""
-Plants catalogue + brand analysis endpoints.
-
-Flow the UI follows:
-  1. GET  /plants/brands         → populate brand dropdown
-  2. POST /plants/analyse        → user enters brand + destination → ranked predictions
-  3. User picks a result, clicks "Schedule Delivery"
-  4. POST /dispatch              → creates a pending trip (in trips.py)
-  5. On the day: POST /trips/{id}/begin → truck loads, trip goes in_progress
-  6. Real-time SSE monitoring (existing)
-  7. POST /trips/{id}/complete   → outcome recorded in DB
-"""
+"""Database-backed plant catalogue and dispatch planning."""
 import asyncio
-import json
 import logging
-import re
 import time
-from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from cachetools import TTLCache
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
+from sqlalchemy.orm import Session
 
+from app.auth import Principal, get_current_principal, require_plant_admin, require_super_admin
+from app.config import settings
+from app.db import get_db
+from app.db.models import Brand, Plant
 from app.dependencies import get_prediction_service
 from app.schemas import (
-    BrandAnalysisRequest,
-    BrandAnalysisResponse,
-    PlantCreate,
-    PlantOut,
-    PlantPredictionResult,
-    PlantUpdate,
+    BrandAnalysisRequest, BrandAnalysisResponse, PlantCreate, PlantOut,
+    PlantPage, PlantPredictionResult, PlantUpdate,
 )
+from app.services.catalogue import CatalogueService, catalogue_error, plant_out, plant_schema
 from app.services.llm_analyzer import LLMAnalyzer
 from app.services.plant_locator import PlantLocator
 from app.services.prediction import PredictionService
 
-_PLANTS_JSON = Path(__file__).parent.parent.parent.parent.parent / "config" / "plants.json"
-
-
-def _load_all_plants() -> List[dict]:
-    """Load ALL plants (including inactive) directly from file."""
-    with open(_PLANTS_JSON, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_plants(plants: List[dict]) -> None:
-    """Write plants list back to file and bust the PlantLocator cache."""
-    with open(_PLANTS_JSON, "w", encoding="utf-8") as f:
-        json.dump(plants, f, indent=2, ensure_ascii=False)
-    # Bust singleton cache so next request reloads
-    PlantLocator._plants = None
-
-
-def _make_id(name: str, brand: str) -> str:
-    """Generate a slug ID from brand + name."""
-    slug = re.sub(r"[^a-z0-9]+", "_", (brand + " " + name).lower()).strip("_")
-    return slug
-
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/plants", tags=["plants"])
-
-# Cache the full analyse_brand response for 10 minutes.
-# Key: (brand_lower, job_site_address_lower, concrete_mix_upper, 10-min time bucket)
-# This prevents repeat API calls when a dispatcher re-opens the panel or clicks
-# Analyse within the same 10-minute window.
 _analysis_cache: TTLCache = TTLCache(maxsize=200, ttl=600)
 
-# ── Helpers ───────────────────────────────────────────────────────────────
 
-def _locator() -> PlantLocator:
-    """Return a PlantLocator (singleton via class-level cache)."""
-    return PlantLocator()
+def idempotency_key(
+    key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=100),
+) -> str:
+    if not key.strip() or key != key.strip():
+        raise catalogue_error(422, "INVALID_IDEMPOTENCY_KEY", "Use a non-blank idempotency key without surrounding whitespace")
+    return key
 
 
-def _plant_to_schema(p: dict) -> PlantOut:
-    return PlantOut(
-        id=p["id"],
-        name=p["name"],
-        brand=p["brand"],
-        address=p["address"],
-        lat=p["lat"],
-        lng=p["lng"],
-        region=p["region"],
-        active=p.get("active", True),
+@router.get("", response_model=PlantPage)
+def list_plants(
+    brand_id: Optional[str] = None, region_id: Optional[str] = None,
+    country_code: Optional[str] = Query(None, pattern=r"^[A-Z]{2}$"),
+    organization_id: Optional[str] = None,
+    city_id: Optional[str] = None,
+    state_id: Optional[str] = None,
+    administrative_area: Optional[str] = None,
+    active_only: bool = True,
+    limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
+):
+    from app.db.models import Region
+
+    query = db.query(Plant).join(Region, Plant.region_id == Region.id)
+    if not principal.is_super_admin:
+        if organization_id is not None and organization_id != principal.organization_id:
+            raise HTTPException(status_code=403, detail="Cannot access another business's plants")
+        organization_id = principal.organization_id
+    if organization_id is not None:
+        query = query.join(Brand, Brand.id == Plant.brand_id).filter(
+            Plant.organization_id == organization_id,
+            Brand.organization_id == organization_id,
+            Region.organization_id == organization_id,
+        )
+    if active_only:
+        query = query.filter(Plant.active.is_(True))
+    if brand_id:
+        query = query.filter(Plant.brand_id == brand_id)
+    if region_id:
+        query = query.filter(Plant.region_id == region_id)
+    if country_code:
+        query = query.filter(Region.country_code == country_code)
+    if city_id:
+        query = query.filter(Region.city_id == city_id)
+    if state_id:
+        from app.db.geography import City
+
+        query = query.join(City, City.id == Region.city_id).filter(City.state_id == state_id)
+    if administrative_area:
+        query = query.filter(Region.administrative_area == administrative_area)
+    return PlantPage(
+        items=[plant_out(p) for p in query.order_by(Plant.id).offset(offset).limit(limit).all()],
+        total=query.count(), limit=limit, offset=offset,
     )
 
 
-# ── Catalogue endpoints ───────────────────────────────────────────────────
-
-@router.get("", response_model=List[PlantOut], summary="List all active plants")
-def list_plants(
-    brand: Optional[str] = Query(None, description="Filter by brand name (case-insensitive)"),
-    region: Optional[str] = Query(None, description="Filter by region slug"),
-    active_only: bool = Query(True, description="Return only active plants"),
+@router.get("/{plant_id}", response_model=PlantOut)
+def get_plant(
+    plant_id: str,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
 ):
-    """
-    Return the full plant catalogue from `config/plants.json`.
+    query = db.query(Plant).filter(Plant.id == plant_id)
+    if not principal.is_super_admin:
+        from app.db.models import Region
 
-    Use `brand` or `region` query params to narrow results.
-    """
-    loc = _locator()
-    plants = loc._plants or []
-
-    if active_only:
-        plants = [p for p in plants if p.get("active", True)]
-    if brand:
-        plants = [p for p in plants if p["brand"].lower() == brand.lower()]
-    if region:
-        plants = [p for p in plants if p["region"].lower() == region.lower()]
-
-    return [_plant_to_schema(p) for p in plants]
+        query = query.join(Brand, Brand.id == Plant.brand_id).join(Region, Region.id == Plant.region_id).filter(
+            Plant.organization_id == principal.organization_id,
+            Brand.organization_id == principal.organization_id,
+            Region.organization_id == principal.organization_id,
+        )
+    plant = query.first()
+    if plant is None:
+        raise HTTPException(status_code=404, detail="Plant not found")
+    return plant_out(plant)
 
 
-@router.get("/brands", response_model=List[str], summary="List distinct plant brands")
-def list_brands():
-    """
-    Return alphabetically-sorted distinct brand names.
-
-    Use this to populate the **Brand** dropdown in the dispatch UI.
-    """
-    loc = _locator()
-    brands = sorted({p["brand"] for p in (loc._plants or []) if p.get("active", True)})
-    return brands
-
-
-@router.get("/regions", response_model=List[str], summary="List distinct regions")
-def list_regions():
-    """Return distinct region slugs (e.g. `central_west`, `north_shore`)."""
-    loc = _locator()
-    regions = sorted({p["region"] for p in (loc._plants or []) if p.get("active", True)})
-    return regions
+@router.post("", response_model=PlantOut, status_code=201)
+def create_plant(
+    body: PlantCreate, response: Response,
+    key: str = Depends(idempotency_key), db: Session = Depends(get_db),
+    principal: Principal = Depends(require_super_admin),
+):
+    result = CatalogueService(db, actor_user_id=principal.user_id).create("plant", body, key)
+    response.headers["Location"] = f"{settings.api_v1_prefix}/plants/{result.id}"
+    _analysis_cache.clear()
+    return result
 
 
-@router.get("/{plant_id}", response_model=PlantOut, summary="Get a single plant by ID")
-def get_plant(plant_id: str):
-    """Look up one plant by its `id` field from plants.json."""
-    loc = _locator()
-    plant = loc.get_by_id(plant_id)
-    if not plant:
-        raise HTTPException(status_code=404, detail=f"Plant '{plant_id}' not found")
-    return _plant_to_schema(plant)
+@router.patch("/{plant_id}", response_model=PlantOut)
+def patch_plant(
+    plant_id: str, body: PlantUpdate, db: Session = Depends(get_db),
+    principal: Principal = Depends(require_super_admin),
+):
+    result = CatalogueService(db, actor_user_id=principal.user_id).patch("plant", plant_id, body)
+    _analysis_cache.clear()
+    return result
 
 
-# ── CRUD write endpoints ─────────────────────────────────────────────────────
-
-@router.post("", response_model=PlantOut, status_code=201, summary="Add a new plant")
-def create_plant(body: PlantCreate):
-    plants = _load_all_plants()
-    new_id = _make_id(body.name, body.brand)
-    # Ensure uniqueness
-    existing_ids = {p["id"] for p in plants}
-    base_id, counter = new_id, 2
-    while new_id in existing_ids:
-        new_id = f"{base_id}_{counter}"
-        counter += 1
-    new_plant = {
-        "id": new_id,
-        "name": body.name,
-        "brand": body.brand,
-        "address": body.address,
-        "lat": body.lat,
-        "lng": body.lng,
-        "region": body.region,
-        "active": body.active,
-    }
-    plants.append(new_plant)
-    _save_plants(plants)
-    logger.info("Plant created: %s", new_id)
-    return _plant_to_schema(new_plant)
-
-
-@router.put("/{plant_id}", response_model=PlantOut, summary="Replace a plant")
-def update_plant(plant_id: str, body: PlantCreate):
-    plants = _load_all_plants()
-    idx = next((i for i, p in enumerate(plants) if p["id"] == plant_id), None)
-    if idx is None:
-        raise HTTPException(status_code=404, detail=f"Plant '{plant_id}' not found")
-    updated = {
-        "id": plant_id,
-        "name": body.name,
-        "brand": body.brand,
-        "address": body.address,
-        "lat": body.lat,
-        "lng": body.lng,
-        "region": body.region,
-        "active": body.active,
-    }
-    plants[idx] = updated
-    _save_plants(plants)
-    logger.info("Plant updated: %s", plant_id)
-    return _plant_to_schema(updated)
-
-
-@router.patch("/{plant_id}", response_model=PlantOut, summary="Partial update / toggle active")
-def patch_plant(plant_id: str, body: PlantUpdate):
-    plants = _load_all_plants()
-    idx = next((i for i, p in enumerate(plants) if p["id"] == plant_id), None)
-    if idx is None:
-        raise HTTPException(status_code=404, detail=f"Plant '{plant_id}' not found")
-    p = plants[idx]
-    if body.name is not None:    p["name"] = body.name
-    if body.brand is not None:   p["brand"] = body.brand
-    if body.address is not None: p["address"] = body.address
-    if body.lat is not None:     p["lat"] = body.lat
-    if body.lng is not None:     p["lng"] = body.lng
-    if body.region is not None:  p["region"] = body.region
-    if body.active is not None:  p["active"] = body.active
-    plants[idx] = p
-    _save_plants(plants)
-    logger.info("Plant patched: %s", plant_id)
-    return _plant_to_schema(p)
-
-
-@router.delete("/{plant_id}", status_code=204, summary="Delete a plant")
-def delete_plant(plant_id: str):
-    plants = _load_all_plants()
-    original_len = len(plants)
-    plants = [p for p in plants if p["id"] != plant_id]
-    if len(plants) == original_len:
-        raise HTTPException(status_code=404, detail=f"Plant '{plant_id}' not found")
-    _save_plants(plants)
-    logger.info("Plant deleted: %s", plant_id)
-
-
-# ── Brand analysis ────────────────────────────────────────────────────────
-
-@router.post(
-    "/analyse",
-    response_model=BrandAnalysisResponse,
-    summary="Analyse all plants of a brand for a job site",
-)
+@router.post("/analyse", response_model=BrandAnalysisResponse)
 async def analyse_brand(
     req: BrandAnalysisRequest,
     prediction_svc: PredictionService = Depends(get_prediction_service),
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_plant_admin),
 ):
-    """
-    **Core dispatch-planning endpoint.**
-
-    Given a **brand** and **job site address**, runs the full prediction engine
-    for every active plant of that brand in parallel and returns a ranked list
-    (best remaining concrete life first).
-
-    The dispatcher can inspect each plant's ETA, remaining life, risk level and
-    delay constant, then click one to schedule a delivery.
-
-    ### Fields in each result
-    | Field | Meaning |
-    |---|---|
-    | `adjusted_eta_minutes` | Google ETA × NZTA delay constant |
-    | `remaining_life_minutes` | `concrete_window - loading_time - adjusted_eta` |
-    | `buffer_depletion_rate` | `adjusted_eta / concrete_window` (0–1) |
-    | `risk_level` | `low / medium / high / critical` |
-    | `success_probability` | 0–1 statistical likelihood of on-time pour |
-    """
-    # Extract the display_name from the incoming job_site_data object
-    job_site_address = req.job_site_data.get("display_name")
-    if not job_site_address:
-        raise HTTPException(
-            status_code=400,
-            detail="`job_site_data` must contain a `display_name` field.",
-        )
-
-    # ── Cache lookup ──────────────────────────────────────────────────
-    # Key uses a 10-min time bucket so cache entries expire naturally within the TTL.
-    time_bucket = int(time.time()) // 600
-    cache_key = (req.brand.lower(), job_site_address.lower(), req.concrete_mix.upper(), time_bucket)
+    address = req.job_site_data.get("display_name")
+    if not isinstance(address, str) or not address.strip():
+        raise catalogue_error(422, "INVALID_DESTINATION", "job_site_data.display_name must be a non-blank address")
+    address = address.strip()
+    brand = CatalogueService(db).get(Brand, req.brand_id)
+    if brand.organization_id != principal.organization_id:
+        raise HTTPException(status_code=403, detail="Cannot analyse another business's brand")
+    loc = PlantLocator(
+        db,
+        organization_id=principal.organization_id,
+    )
+    candidates = [
+        p for p in loc.plants
+        if p["brand_id"] == req.brand_id
+        and (not req.region_id or p["region_id"] == req.region_id)
+        and (not req.country_code or p["country_code"] == req.country_code)
+        and req.concrete_mix in p["supported_mix_codes"]
+    ]
+    if not candidates:
+        raise catalogue_error(404, "NO_ELIGIBLE_PLANTS", "No active plants support the requested brand, region, country, and mix")
+    countries = {p["country_code"] for p in candidates}
+    if len(countries) != 1:
+        raise catalogue_error(422, "COUNTRY_REQUIRED", "Select country_code or region_id for a brand operating in multiple countries")
+    country = next(iter(countries))
+    signature = tuple(
+        (p["id"], p["version"], p["brand_version"], p["region_version"])
+        for p in candidates
+    )
+    cache_key = (
+        principal.organization_id, req.brand_id, req.region_id, address.lower(), req.concrete_mix,
+        req.top_n, req.include_llm_analysis, country, signature, int(time.time()) // 600,
+    )
     cached = _analysis_cache.get(cache_key)
     if cached is not None:
-        logger.info(
-            "analyse_brand cache HIT: brand=%s, job_site=%s (saved %d Google API calls)",
-            req.brand, job_site_address[:40], len(cached.results),
-        )
         return cached
-
-    loc = _locator()
-    all_plants = loc._plants or []
-
-    # Get all active plants for this brand
-    brand_plants = [
-        p for p in all_plants
-        if p["brand"].lower() == req.brand.lower() and p.get("active", True)
-    ]
-
-    if not brand_plants:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No active plants found for brand '{req.brand}'. "
-                   f"Available brands: {sorted({p['brand'] for p in all_plants if p.get('active', True)})}",
+    if len(candidates) > req.top_n:
+        try:
+            geo = await prediction_svc.geocode_job_site(address, country)
+        except Exception as exc:
+            raise catalogue_error(502, "DESTINATION_LOOKUP_FAILED", f"Could not resolve destination: {exc}") from exc
+        ranked = loc.nearest_by_distance(
+            geo["latitude"], geo["longitude"], brand_id=req.brand_id,
         )
+        eligible = {p["id"] for p in candidates}
+        candidates = [p for p in ranked if p["id"] in eligible]
+    candidates = candidates[:req.top_n]
 
-    # Limit to top_n closest plants to avoid burning too many API calls
-    brand_plants = brand_plants[: req.top_n]
-
-    # ── Run predictions in parallel ──────────────────────────────────
-    async def _predict_one(plant: dict) -> PlantPredictionResult:
+    async def predict_one(plant: dict) -> PlantPredictionResult:
+        output = plant_schema(plant)
         try:
             result = await prediction_svc.predict_delivery(
-                start_address=plant["address"],
-                end_address=job_site_address,
-                concrete_mix=req.concrete_mix,
-                include_llm=False,  # Never call LLM for multi-plant comparison — too slow
+                start_address=plant["address"], end_address=address,
+                concrete_mix=req.concrete_mix, include_llm=False,
+                country_code=country,
             )
-            pred = result.get("prediction", {})
-            traffic = result.get("traffic", {})
+            if result.get("error"):
+                logger.warning("Prediction failed for plant %s: %s", plant["id"], result["error"])
+                return PlantPredictionResult(plant=output, error=result["error"])
+            pred, traffic = result["prediction"], result["traffic"]
             return PlantPredictionResult(
-                plant=_plant_to_schema(plant),
-                google_eta_minutes=traffic.get("google_eta_minutes"),
-                adjusted_eta_minutes=pred.get("adjusted_eta_minutes"),
-                remaining_life_minutes=pred.get("remaining_life_minutes"),
-                buffer_depletion_rate=pred.get("buffer_depletion_rate"),
-                delay_constant_used=pred.get("delay_constant_used"),
-                risk_level=pred.get("risk_level"),
-                success_probability=pred.get("success_probability"),
-                recommendation=result.get("recommendation"),
-                llm_analysis=result.get("llm_analysis") if req.include_llm_analysis else None,
+                plant=output, google_eta_minutes=traffic["google_eta_minutes"],
+                adjusted_eta_minutes=pred["adjusted_eta_minutes"],
+                remaining_life_minutes=pred["remaining_life_minutes"],
+                buffer_depletion_rate=pred["buffer_depletion_rate"],
+                delay_constant_used=pred["delay_constant_used"],
+                risk_level=pred["risk_level"], success_probability=pred["success_probability"],
+                recommendation=result["recommendation"],
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("Prediction failed for plant %s: %s", plant["id"], exc)
-            return PlantPredictionResult(
-                plant=_plant_to_schema(plant),
-                error=str(exc),
+            return PlantPredictionResult(plant=output, error=str(exc))
+
+    results = await asyncio.gather(*(predict_one(p) for p in candidates))
+    results.sort(key=lambda r: (
+        r.remaining_life_minutes is None,
+        -(r.remaining_life_minutes or 0), r.plant.id,
+    ))
+    valid = [r for r in results if r.error is None and r.remaining_life_minutes is not None]
+    comparison = None
+    if req.include_llm_analysis and valid:
+        analyzer = LLMAnalyzer()
+        try:
+            comparison = await analyzer.compare_plants(
+                plants_data=[{
+                    "plant_name": r.plant.name, "plant_address": r.plant.address,
+                    "google_eta": r.google_eta_minutes,
+                    "adjusted_eta": r.adjusted_eta_minutes,
+                    "remaining_life": r.remaining_life_minutes,
+                    "risk_level": r.risk_level, "success_prob": r.success_probability,
+                    "buffer_depletion": r.buffer_depletion_rate,
+                } for r in valid],
+                job_site=address, concrete_mix=req.concrete_mix,
             )
-
-    results: List[PlantPredictionResult] = await asyncio.gather(
-        *[_predict_one(p) for p in brand_plants]
-    )
-
-    # ── Rank: highest remaining life first; errors go last ───────────
-    def _sort_key(r: PlantPredictionResult) -> float:
-        if r.remaining_life_minutes is not None:
-            return -r.remaining_life_minutes   # negate → ascending sort = best first
-        return 9999.0                          # errors sink to bottom
-
-    results = sorted(results, key=_sort_key)
-
-    # Best plant = first non-error result
-    best_id: Optional[str] = None
-    for r in results:
-        if r.error is None and r.remaining_life_minutes is not None:
-            best_id = r.plant.id
-            break
-
-    # ── Single LLM call to compare ALL plants and recommend best ────
-    llm_comparison = None
-    if req.include_llm_analysis:
-        valid = [r for r in results if r.error is None and r.remaining_life_minutes is not None]
-        if valid:
-            plants_data = [
-                {
-                    "plant_name": r.plant.name,
-                    "plant_address": r.plant.address,
-                    "google_eta": r.google_eta_minutes or 0,
-                    "adjusted_eta": r.adjusted_eta_minutes or 0,
-                    "remaining_life": r.remaining_life_minutes or 0,
-                    "risk_level": r.risk_level or "unknown",
-                    "success_prob": r.success_probability or 0,
-                    "buffer_depletion": r.buffer_depletion_rate or 0,
-                }
-                for r in valid
-            ]
-            try:
-                analyzer = LLMAnalyzer()
-                llm_comparison = await analyzer.compare_plants(
-                    plants_data=plants_data,
-                    job_site=job_site_address,
-                    concrete_mix=req.concrete_mix,
-                )
-            except Exception as exc:
-                logger.warning("LLM comparison failed: %s", exc)
-
+        except Exception as exc:
+            logger.warning("LLM comparison failed: %s", exc)
+        finally:
+            await analyzer.close()
     response = BrandAnalysisResponse(
-        brand=req.brand,
-        job_site_address=job_site_address,
-        concrete_mix=req.concrete_mix,
-        total_plants_analysed=len(results),
-        results=results,
-        best_plant_id=best_id,
-        llm_comparison=llm_comparison,
+        brand=brand.name, brand_id=brand.id, job_site_address=address,
+        concrete_mix=req.concrete_mix, total_plants_analysed=len(results),
+        results=results, best_plant_id=valid[0].plant.id if valid else None,
+        llm_comparison=comparison,
     )
-    _analysis_cache[cache_key] = response
+    if all(r.error is None for r in results):
+        _analysis_cache[cache_key] = response
     return response

@@ -1,5 +1,5 @@
 """
-LLM Analyzer — Natural language risk assessment via Ollama (qwen2.5:3b).
+LLM Analyzer — Natural language risk assessment via Ollama (default), OpenRouter or Gemini.
 
 DESIGN RULE:
   The LLM only reasons and explains. It NEVER calculates.
@@ -20,6 +20,7 @@ from typing import Optional
 
 import httpx
 
+from app.config import settings
 from app.rmc.predictor import DeliveryPrediction
 
 logger = logging.getLogger(__name__)
@@ -47,14 +48,36 @@ class LLMAnalyzer:
     MODEL       = "qwen2.5:3b"   # pinned — change this one line to swap model
     OLLAMA_URL  = "http://localhost:11434/api/generate"
     OLLAMA_TAGS = "http://localhost:11434/api/tags"
+    OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+    GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    # Free-tier model names change; override with LLM_MODEL in .env if one is retired.
+    DEFAULT_MODELS = {
+        "openrouter": "meta-llama/llama-3.3-70b-instruct:free",
+        "gemini": "gemini-2.5-flash",
+    }
 
     def __init__(self):
         self._client         = httpx.AsyncClient(timeout=90.0)
         self.available_model: Optional[str] = self.MODEL
         self._ollama_checked  = False
+        self.provider         = (settings.llm_provider or "ollama").strip().lower()
 
     async def _ensure_checked(self) -> bool:
         """Lazy-check Ollama on first use."""
+        if self.provider != "ollama":
+            if self._ollama_checked:
+                return self.available_model is not None
+            self._ollama_checked = True
+            key = {"openrouter": settings.openrouter_api_key, "gemini": settings.gemini_api_key}.get(self.provider, "")
+            if not key:
+                logger.warning(
+                    f"LLMAnalyzer: provider '{self.provider}' unknown or API key missing. Template fallback active."
+                )
+                self.available_model = None
+                return False
+            self.available_model = settings.llm_model or self.DEFAULT_MODELS[self.provider]
+            logger.info(f"LLMAnalyzer: using {self.provider}:{self.available_model}")
+            return True
         if self._ollama_checked:
             return self.available_model is not None
         self._ollama_checked = True
@@ -81,6 +104,67 @@ class LLMAnalyzer:
             logger.warning(f"LLMAnalyzer: Ollama unreachable ({e}). Template fallback active.")
             self.available_model = None
             return False
+
+    async def _generate(self, prompt: str, max_tokens: int, timeout: float) -> Optional[str]:
+        """One completion from the configured provider. Returns raw text, or None on a non-200."""
+        if self.provider == "openrouter":
+            resp = await self._client.post(
+                self.OPENROUTER_URL,
+                headers={"Authorization": f"Bearer {settings.openrouter_api_key}"},
+                json={
+                    "model": self.available_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                },
+                timeout=min(timeout, 30.0),
+            )
+            if resp.status_code != 200:
+                logger.warning(f"LLMAnalyzer: OpenRouter returned HTTP {resp.status_code}")
+                return None
+            choices = resp.json().get("choices") or []
+            return choices[0].get("message", {}).get("content") if choices else None
+
+        if self.provider == "gemini":
+            resp = await self._client.post(
+                self.GEMINI_URL.format(model=self.available_model),
+                headers={"x-goog-api-key": settings.gemini_api_key},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0.2,
+                        "maxOutputTokens": max_tokens * 3,  # headroom: some Gemini models spend tokens thinking
+                        "responseMimeType": "application/json",
+                    },
+                },
+                timeout=min(timeout, 30.0),
+            )
+            if resp.status_code != 200:
+                logger.warning(f"LLMAnalyzer: Gemini returned HTTP {resp.status_code}")
+                return None
+            candidates = resp.json().get("candidates") or []
+            parts = (candidates[0].get("content", {}).get("parts") or []) if candidates else []
+            return "".join(p.get("text", "") for p in parts) or None
+
+        resp = await self._client.post(
+            self.OLLAMA_URL,
+            json={
+                "model": self.available_model,
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",          # forces valid JSON at token level
+                "options": {
+                    "temperature": 0.2,
+                    "top_p": 0.9,
+                    "num_predict": max_tokens,
+                    "num_ctx": 131072,
+                },
+            },
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json().get("response", "")
 
     def _build_prompt(self, pred: DeliveryPrediction, route_desc: str) -> str:
         """
@@ -163,28 +247,11 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
             prompt = self._build_prompt(pred, route_desc)
             for attempt in range(2):
                 try:
-                    resp = await self._client.post(
-                        self.OLLAMA_URL,
-                        json={
-                            "model": self.available_model,
-                            "prompt": prompt,
-                            "stream": False,
-                            "format": "json",          # forces valid JSON at token level
-                            "options": {
-                                "temperature": 0.2,
-                                "top_p": 0.9,
-                                "num_predict": 400,
-                                "num_ctx": 131072,
-                            },
-                        },
-                        timeout=90.0,
-                    )
-                    if resp.status_code == 200:
-                        raw    = resp.json().get("response", "")
-                        parsed = self._parse_json_response(raw)
-                        if parsed:
-                            return {"source": f"llm:{self.available_model}", **parsed}
-                        logger.warning(f"LLMAnalyzer: attempt {attempt+1} non-JSON response")
+                    raw    = await self._generate(prompt, max_tokens=400, timeout=90.0)
+                    parsed = self._parse_json_response(raw) if raw else None
+                    if parsed:
+                        return {"source": f"llm:{self.available_model}", **parsed}
+                    logger.warning(f"LLMAnalyzer: attempt {attempt+1} no usable JSON")
                 except Exception as e:
                     logger.warning(f"LLMAnalyzer: attempt {attempt+1} failed: {e}")
 
@@ -259,28 +326,11 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
         prompt = self._build_comparison_prompt(plants_data, job_site, concrete_mix)
         for attempt in range(2):
             try:
-                resp = await self._client.post(
-                    self.OLLAMA_URL,
-                    json={
-                        "model": self.available_model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "format": "json",
-                        "options": {
-                            "temperature": 0.2,
-                            "top_p": 0.9,
-                            "num_predict": 600,
-                            "num_ctx": 131072,
-                        },
-                    },
-                    timeout=120.0,
-                )
-                if resp.status_code == 200:
-                    raw = resp.json().get("response", "")
-                    parsed = self._parse_json_response(raw)
-                    if parsed:
-                        return {"source": f"llm:{self.available_model}", **parsed}
-                    logger.warning("LLMAnalyzer compare: attempt %d non-JSON", attempt + 1)
+                raw = await self._generate(prompt, max_tokens=600, timeout=120.0)
+                parsed = self._parse_json_response(raw) if raw else None
+                if parsed:
+                    return {"source": f"llm:{self.available_model}", **parsed}
+                logger.warning("LLMAnalyzer compare: attempt %d no usable JSON", attempt + 1)
             except Exception as e:
                 logger.warning("LLMAnalyzer compare: attempt %d failed: %s", attempt + 1, e)
 

@@ -74,7 +74,7 @@
     "name": "Firth Penrose",
     "brand": "Firth",
     "address": "810 Great South Road, Penrose, Auckland",
-    "lat": -36.9112830,
+    "lat": -36.911283,
     "lng": 174.8190881,
     "region": "central_south",
     "active": true
@@ -134,7 +134,7 @@
     "name": "Concretec Pokeno",
     "brand": "Concretec",
     "address": "587 Ridge Road, Pokeno",
-    "lat": -37.2169540,
+    "lat": -37.216954,
     "lng": 174.9989982,
     "region": "south",
     "active": true
@@ -197,6 +197,36 @@
     "lat": -36.9471619,
     "lng": 174.9016068,
     "region": "south_east",
+    "active": true
+  },
+  {
+    "id": "india_nit_warangal",
+    "name": "NIT Warangal",
+    "brand": "India",
+    "address": "NIT Warangal, Warangal, Telangana, India",
+    "lat": 17.9833537,
+    "lng": 79.5335163,
+    "region": "warangal",
+    "active": true
+  },
+  {
+    "id": "india_hanamkonda_chowrastha",
+    "name": "Hanamkonda Chowrastha",
+    "brand": "India",
+    "address": "Hanamkonda Chowrastha, Hanamkonda, Telangana, India",
+    "lat": 18.0063202,
+    "lng": 79.5703989,
+    "region": "warangal",
+    "active": true
+  },
+  {
+    "id": "india_ku_x_roads",
+    "name": "KU X Roads",
+    "brand": "India",
+    "address": "KU X Roads, Hanamkonda, Telangana, India",
+    "lat": 18.0207552,
+    "lng": 79.550469,
+    "region": "warangal",
     "active": true
   }
 ]

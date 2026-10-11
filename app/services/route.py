@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Dict, Optional, List
 
 from cachetools import TTLCache
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.models import Route, TrafficSnapshot
@@ -33,9 +34,17 @@ def get_route_cache_stats() -> Dict:
 class RouteService:
     """Service for route calculation and optimization"""
 
-    def __init__(self, db: Session, google_maps_client: GoogleMapsService):
+    def __init__(
+        self,
+        db: Session,
+        google_maps_client: GoogleMapsService,
+        organization_id: Optional[str] = None,
+        actor_user_id: Optional[str] = None,
+    ):
         self.db = db
         self.google_maps = google_maps_client
+        self.organization_id = organization_id
+        self.actor_user_id = actor_user_id
 
     def _get_route_cache_key(self, route_request: RouteCreate) -> str:
         """Generate a cache key for the route request"""
@@ -57,6 +66,7 @@ class RouteService:
         route_idx = str(route_request.route_index)
         
         key_parts = [
+            self.organization_id or "",
             start_addr, end_addr, vehicle_type, priority, time_bucket,
             avoid_str, alt_str, route_idx,
         ]
@@ -116,9 +126,6 @@ class RouteService:
             if route_request.departure_datetime:
                 dt = route_request.departure_datetime
                 now = datetime.now(timezone.utc)
-                # Ensure tz-aware comparison
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
                 if dt <= now:
                     logger.info(
                         f"departure_datetime {dt.isoformat()} is in the past — using 'now' for Directions API"
@@ -237,6 +244,8 @@ class RouteService:
 
             # Save to database
             db_route = Route(
+                organization_id=self.organization_id,
+                created_by_user_id=self.actor_user_id,
                 start_address=route_request.start.address,
                 start_lat=start_geo["latitude"],
                 start_lng=start_geo["longitude"],
@@ -311,9 +320,18 @@ class RouteService:
 
     def get_route(self, route_id: int) -> Optional[RouteResponse]:
         """Retrieve a previously calculated route"""
-        db_route = self.db.query(Route).filter(Route.id == route_id).first()
+        query = self.db.query(Route).filter(Route.id == route_id)
+        db_route = query.first()
         if not db_route:
             return None
+        if self.organization_id is not None:
+            if db_route.organization_id is None:
+                return None
+            if db_route.organization_id != self.organization_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cannot access another organization's route",
+                )
 
         # Reconstruct route steps from JSON
         route_steps = []
@@ -433,6 +451,8 @@ class RouteService:
     def get_route_history(self, vehicle_id: Optional[str] = None, limit: int = 10):
         """Retrieve route history"""
         query = self.db.query(Route)
+        if self.organization_id is not None:
+            query = query.filter(Route.organization_id == self.organization_id)
         if vehicle_id:
             query = query.filter(Route.vehicle_id == vehicle_id)
 

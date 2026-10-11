@@ -1,9 +1,20 @@
 """Tests for route endpoints"""
 import pytest
 from fastapi.testclient import TestClient
+from unittest.mock import Mock
 
+from app.auth import Principal, get_current_principal
+from app.dependencies import get_route_service
 from app.main import app
 
+app.dependency_overrides[get_current_principal] = lambda: Principal(
+    user_id="test-admin", organization_id="test-org",
+    organization_role="org:admin", is_super_admin=False,
+)
+route_service_mock = Mock()
+route_service_mock.get_route.return_value = None
+route_service_mock.get_route_history.return_value = []
+app.dependency_overrides[get_route_service] = lambda: route_service_mock
 client = TestClient(app)
 
 
