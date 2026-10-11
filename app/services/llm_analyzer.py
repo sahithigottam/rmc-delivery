@@ -282,12 +282,6 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
                 f"Concrete is very likely to set before arrival."
             ),
         }
-        recommendations = {
-            "low":      "Dispatch now. Conditions are favourable.",
-            "moderate": "Dispatch with caution. Monitor traffic en route. Have reroute plan ready.",
-            "high":     "Consider delaying dispatch, using retarder admixture, or sourcing from closer plant.",
-            "critical": "Do NOT dispatch. Use retarder mix, source from closer plant, or reschedule.",
-        }
         key = pred.risk_level if pred.risk_level in summaries else "moderate"
         top_risk = pred.risk_factors[0] if pred.risk_factors else {
             "name": "General conditions", "detail": "No specific critical concerns."
@@ -303,7 +297,7 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
         return {
             "risk_summary":      summaries[key],
             "key_concern":       f"{top_risk['name']}: {top_risk['detail']}",
-            "recommendation":    recommendations[key],
+            "recommendation":    self._template_dispatch_advice(pred.risk_level),
             "confidence":        pred.confidence.upper(),
             "confidence_reason": conf_reason,
         }
@@ -379,6 +373,19 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
 }}"""
 
     @staticmethod
+    def _template_dispatch_advice(risk_level: str) -> str:
+        recommendations = {
+            "low": "Dispatch now. Conditions are favourable.",
+            "moderate": "Dispatch with caution. Monitor traffic en route. Have reroute plan ready.",
+            "high": "Consider delaying dispatch, using retarder admixture, or sourcing from closer plant.",
+            "critical": "Do NOT dispatch. Use retarder mix, source from closer plant, or reschedule.",
+        }
+        if risk_level not in recommendations:
+            logger.warning("Template dispatch advice unavailable: unrecognized risk level")
+            return "Do not dispatch until the risk assessment has been reviewed."
+        return recommendations[risk_level]
+
+    @staticmethod
     def _template_comparison(plants_data: list[dict]) -> dict:
         if not plants_data:
             return {
@@ -405,10 +412,7 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
                 f"Second-best remaining life ({alt['remaining_life']:.0f} min)."
                 if alt else "No alternative available."
             ),
-            "dispatch_advice": (
-                "Dispatch now." if best["risk_level"] == "low"
-                else "Dispatch with caution — monitor traffic."
-            ),
+            "dispatch_advice": LLMAnalyzer._template_dispatch_advice(best["risk_level"]),
         }
 
     async def close(self):
