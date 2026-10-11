@@ -80,7 +80,7 @@ def subscribe_trip(trip_id: int) -> asyncio.Queue:
     """Register an SSE subscriber for a trip. Returns a Queue to read events from."""
     q: asyncio.Queue = asyncio.Queue()
     _sse_subscribers.setdefault(trip_id, set()).add(q)
-    logger.info(f"SSE subscriber added for trip {trip_id} (total: {len(_sse_subscribers[trip_id])})")
+    logger.debug("SSE subscriber added for trip %s (total: %s)", trip_id, len(_sse_subscribers[trip_id]))
     return q
 
 
@@ -243,7 +243,7 @@ class TripService:
         self.db.commit()
         self.db.refresh(trip)
 
-        logger.info(f"Trip {trip.id} started: {trip.start_address} → {trip.end_address}")
+        logger.info("Trip %s started", trip.id)
         return self._to_response(trip)
 
     async def update_position(self, trip_id: int, pos: PositionUpdate) -> TripResponse:
@@ -489,8 +489,8 @@ class TripService:
         self.db.refresh(trip)
 
         logger.info(
-            "Trip %s dispatched (pending): %s → %s, scheduled %s",
-            trip.id, plant["name"], req.job_site_address, req.scheduled_at,
+            "Trip %s dispatched (pending), scheduled %s",
+            trip.id, req.scheduled_at,
         )
 
         duration_min = None
@@ -916,7 +916,7 @@ class TripService:
                 return None
 
         except Exception as e:
-            logger.error(f"Error checking traffic for trip {trip_id}: {e}")
+            logger.exception("Traffic check failed for trip %s", trip_id)
             self.db.rollback()
             self._log_event(trip_id, "traffic_check", {
                 "status": "error", "error": str(e),

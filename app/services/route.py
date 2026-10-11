@@ -93,7 +93,7 @@ class RouteService:
         if cache_key in _route_cache:
             _route_cache_stats["hits"] += 1
             cached_route_id = _route_cache[cache_key]
-            logger.info(f"Route cache HIT - returning existing route ID: {cached_route_id}")
+            logger.debug("Route cache hit id=%s", cached_route_id)
             
             # Fetch the existing route from DB
             existing_route = self.get_route(cached_route_id)
@@ -105,16 +105,16 @@ class RouteService:
                 del _route_cache[cache_key]
         
         _route_cache_stats["misses"] += 1
-        logger.info(f"Route cache MISS - calculating new route")
+        logger.debug("Route cache miss")
         
         try:
             # Geocode addresses to coordinates
-            logger.info(f"Geocoding start address: {route_request.start.address}")
+            logger.debug("Geocoding route start")
             start_geo = await self.google_maps.geocode_address(
                 route_request.start.address
             )
             
-            logger.info(f"Geocoding end address: {route_request.end.address}")
+            logger.debug("Geocoding route end")
             end_geo = await self.google_maps.geocode_address(
                 route_request.end.address
             )
@@ -172,7 +172,7 @@ class RouteService:
             if directions_data.get("status") != "OK":
                 status_code = directions_data.get("status", "UNKNOWN")
                 error_msg = directions_data.get("error_message") or status_code
-                logger.error(f"Google Directions API error: {status_code} — {error_msg}")
+                logger.error("Google Directions API error status=%s", status_code)
                 raise ValueError(f"Route calculation failed: {status_code} — {error_msg}")
 
             # Get all available routes
@@ -314,7 +314,7 @@ class RouteService:
             return self._db_model_to_response(db_route, route_steps)
 
         except Exception as e:
-            logger.error(f"Error estimating route: {e}")
+            logger.exception("Route estimation failed")
             self.db.rollback()
             raise
 

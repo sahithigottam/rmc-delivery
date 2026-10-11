@@ -68,12 +68,12 @@ def get_current_principal(
             options={"require": ["exp", "iat", "iss", "sub"]},
         )
     except (InvalidTokenError, PyJWKClientError, ValueError) as exc:
-        logger.info("Rejected invalid Clerk bearer token: %s", exc)
+        logger.debug("Rejected invalid Clerk bearer token (%s)", type(exc).__name__)
         raise HTTPException(status_code=401, detail="Invalid or expired bearer token") from exc
 
     authorized_party = claims.get("azp")
     if not isinstance(authorized_party, str) or authorized_party not in parties:
-        logger.warning("Rejected Clerk token with unauthorized or missing azp claim")
+        logger.debug("Rejected Clerk token with unauthorized or missing azp claim")
         raise HTTPException(status_code=401, detail="Token was not issued for this application")
 
     user_id = claims.get("sub")

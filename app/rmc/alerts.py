@@ -82,7 +82,7 @@ class AlertService:
                 except Exception as e:
                     logger.error(
                         f"Alert handler {type(handler).__name__} failed on "
-                        f"{event.event_type}: {e}",
+                        f"{event.event_type}",
                         exc_info=True,
                     )
 
@@ -128,7 +128,8 @@ class LoggingAlertHandler:
         severity = getattr(event, "severity", None)
         severity_value = getattr(severity, "value", "info")
         level = self.LEVEL_MAP.get(severity_value, logging.INFO)
-        logger.log(level, f"[ALERT:{event.event_type}] {event.to_dict()}")
+        logger.log(level, "Domain alert event=%s trip_id=%s",
+                   event.event_type, getattr(event, "trip_id", None))
 
 
 class SSEAlertHandler:

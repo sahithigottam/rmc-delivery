@@ -17,6 +17,7 @@ Design:
 """
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -85,7 +86,7 @@ async def _monitor_loop(google_maps: GoogleMapsService):
         except Exception as e:
             consecutive_cycle_errors += 1
             logger.error(
-                f"Traffic monitor cycle error ({consecutive_cycle_errors}): {e}",
+                "Traffic monitor cycle failed (consecutive_errors=%s)", consecutive_cycle_errors,
                 exc_info=True,
             )
             # Exponential backoff if repeated failures
@@ -101,6 +102,7 @@ async def _monitor_loop(google_maps: GoogleMapsService):
 async def _run_check_cycle(google_maps: GoogleMapsService):
     """Run one cycle: query active trips, check each for traffic issues."""
     db: Session = SessionLocal()
+    started = time.perf_counter()
     try:
         # Get all in-progress trips, sorted by priority
         active_trips = (
@@ -116,7 +118,7 @@ async def _run_check_cycle(google_maps: GoogleMapsService):
         if not active_trips:
             return
 
-        logger.info(f"📡 Traffic check cycle: {len(active_trips)} active trip(s)")
+        logger.debug("Traffic cycle active_trips=%s", len(active_trips))
         reroutes_this_cycle = 0
         checks_this_cycle = 0
 
@@ -134,12 +136,12 @@ async def _run_check_cycle(google_maps: GoogleMapsService):
                 checks_this_cycle += 1
                 if result:
                     reroutes_this_cycle += 1
-                    logger.info(
+                    logger.debug(
                         f"  ↳ Trip {trip.id} rerouted: {result.reason}"
                     )
 
             except Exception as e:
-                logger.error(f"  ↳ Trip {trip.id} check failed: {e}")
+                logger.exception("Traffic monitor trip check failed trip_id=%s", trip.id)
                 # Track consecutive failures for this trip
                 _record_trip_check_failure(db, trip)
 
@@ -147,9 +149,11 @@ async def _run_check_cycle(google_maps: GoogleMapsService):
             if len(active_trips) > 1:
                 await asyncio.sleep(INTER_TRIP_DELAY_SECONDS)
 
-        logger.info(
-            f"📡 Cycle done: {checks_this_cycle} checked, "
-            f"{reroutes_this_cycle} rerouted"
+        elapsed = time.perf_counter() - started
+        logger.log(
+            logging.WARNING if elapsed >= CHECK_INTERVAL_SECONDS else logging.DEBUG,
+            "Traffic cycle completed checked=%s rerouted=%s duration_ms=%s",
+            checks_this_cycle, reroutes_this_cycle, round(elapsed * 1000),
         )
 
     finally:
@@ -200,3 +204,4 @@ def _record_trip_check_failure(db: Session, trip: Trip):
             db.commit()
         except Exception:
             db.rollback()
+            logger.exception("Failed to persist traffic review flag trip_id=%s", trip.id)

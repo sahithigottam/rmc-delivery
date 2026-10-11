@@ -244,7 +244,8 @@ DEBUG=true
 ## Monitoring
 
 - API health check: `GET /health`
-- Request logging: Configured in `app/main.py`
+- Operational logging: JSON stdout, generated `X-Request-ID`, slow/error request
+  summaries and dependency diagnostics; see [Render logging](RENDER_DEPLOYMENT.md#low-volume-operational-logging).
 - Database health: Connection pooling with health checks
 - Google API monitoring: Quota tracking (coming in Feature 7)
 

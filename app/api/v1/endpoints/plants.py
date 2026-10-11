@@ -189,7 +189,7 @@ async def analyse_brand(
                 country_code=country,
             )
             if result.get("error"):
-                logger.warning("Prediction failed for plant %s: %s", plant["id"], result["error"])
+                logger.warning("Prediction failed for plant %s", plant["id"])
                 return PlantPredictionResult(plant=output, error=result["error"])
             pred, traffic = result["prediction"], result["traffic"]
             return PlantPredictionResult(
@@ -202,7 +202,7 @@ async def analyse_brand(
                 recommendation=result["recommendation"],
             )
         except Exception as exc:
-            logger.warning("Prediction failed for plant %s: %s", plant["id"], exc)
+            logger.warning("Prediction failed for plant %s (%s)", plant["id"], type(exc).__name__)
             return PlantPredictionResult(plant=output, error=str(exc))
 
     results = await asyncio.gather(*(predict_one(p) for p in candidates))
@@ -227,7 +227,7 @@ async def analyse_brand(
                 job_site=address, concrete_mix=req.concrete_mix,
             )
         except Exception as exc:
-            logger.warning("LLM comparison failed: %s", exc)
+            logger.warning("LLM comparison failed (%s)", type(exc).__name__)
         finally:
             await analyzer.close()
     response = BrandAnalysisResponse(

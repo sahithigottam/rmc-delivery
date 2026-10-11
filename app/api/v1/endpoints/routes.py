@@ -74,19 +74,16 @@ async def estimate_route(
     ```
     """
     try:
-        logger.info(
-            f"Route estimate request: {route_request.start.address} "
-            f"to {route_request.end.address}"
-        )
+        logger.debug("Route estimate requested")
 
         result = await route_service.estimate_route(route_request)
         return result
 
     except ValueError as e:
-        logger.error(f"Validation error: {e}")
+        logger.debug("Route estimate validation failed (%s)", type(e).__name__)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.exception("Route estimate failed")
         raise HTTPException(
             status_code=500,
             detail="Failed to calculate route. Please try again later.",
@@ -119,7 +116,7 @@ async def get_route(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error retrieving route: {e}")
+        logger.exception("Route retrieval failed")
         raise HTTPException(status_code=500, detail="Failed to retrieve route")
 
 
@@ -148,7 +145,7 @@ async def get_route_history(
         )
         return results
     except Exception as e:
-        logger.error(f"Error retrieving route history: {e}")
+        logger.exception("Route history retrieval failed")
         raise HTTPException(status_code=500, detail="Failed to retrieve route history")
 
 
@@ -197,7 +194,7 @@ async def check_reroute(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Reroute check error: {e}")
+        logger.exception("Reroute check failed")
         raise HTTPException(status_code=500, detail="Reroute check failed")
 
 

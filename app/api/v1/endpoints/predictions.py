@@ -167,7 +167,7 @@ async def predict_delivery(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"predict_delivery failed: {e}", exc_info=True)
+        logger.exception("predict_delivery failed")
         raise HTTPException(status_code=500, detail="Prediction failed. Please try again.")
 
 
@@ -218,7 +218,7 @@ async def best_plant(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"best_plant failed: {e}", exc_info=True)
+        logger.exception("best_plant failed")
         raise HTTPException(status_code=500, detail="Best plant check failed. Please try again.")
 
 
@@ -271,5 +271,5 @@ async def nearest_plant(
             ),
         }
     except Exception as e:
-        logger.error(f"nearest_plant failed: {e}", exc_info=True)
+        logger.exception("nearest_plant failed")
         raise HTTPException(status_code=500, detail="Nearest plant lookup failed.")

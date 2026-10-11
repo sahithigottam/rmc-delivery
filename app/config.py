@@ -3,6 +3,7 @@ import logging
 import json
 from pathlib import Path
 from pydantic_settings import BaseSettings
+from pydantic import Field
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class Settings(BaseSettings):
 
     # FastAPI
     log_level: str = "INFO"
+    slow_request_ms: int = Field(2000, ge=1)
     api_v1_prefix: str = "/api/v1"
     api_title: str = "RMC Delivery Route Optimizer"
     api_version: str = "1.0.0"
@@ -98,10 +100,10 @@ def load_settings() -> Settings:
                     db_url = f"postgresql://{username}:{password}@{host}:{port}/{database}"
                 
                 settings.database_url = db_url
-                logger.info(f"Database configured: {db_type} - {settings.database_url}")
+                logger.info("Database configured: %s", db_type)
 
         except Exception as e:
-            logger.warning(f"Could not load credentials from {credentials_file}: {e}")
+            logger.warning("Could not load credentials configuration (%s)", type(e).__name__)
             logger.info("Falling back to environment variables")
 
     return settings

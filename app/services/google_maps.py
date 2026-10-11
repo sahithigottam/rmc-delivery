@@ -1,6 +1,7 @@
 """Google Maps API integration service"""
 import hashlib
 import logging
+import time
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -22,6 +23,28 @@ class GoogleMapsService:
     """Service for Google Maps API operations"""
 
     BASE_URL = "https://maps.googleapis.com/maps/api"
+
+    async def _request(self, url: str, params: dict) -> dict:
+        operation = url.removeprefix(self.BASE_URL + "/")
+        started = time.perf_counter()
+        try:
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            result = response.json()
+        except Exception:
+            logger.exception("google_maps_request_failed operation=%s duration_ms=%s",
+                             operation, round((time.perf_counter() - started) * 1000))
+            raise
+        duration_ms = round((time.perf_counter() - started) * 1000)
+        status = result.get("status", "missing")
+        level = logging.DEBUG
+        if status != "OK" or duration_ms >= settings.slow_request_ms:
+            level = logging.WARNING
+        logger.log(level, "google_maps_request operation=%s status=%s duration_ms=%s",
+                   operation, status, duration_ms,
+                   extra={"event": "google_maps_request", "operation": operation,
+                          "dependency_status": status, "duration_ms": duration_ms})
+        return result
 
     def __init__(self, api_key: str = settings.google_maps_api_key):
         self.api_key = api_key
@@ -144,11 +167,11 @@ class GoogleMapsService:
         
         if cache_key in self._directions_cache:
             self._cache_stats["directions_hits"] += 1
-            logger.info(f"Directions cache HIT for route {start_lat},{start_lng} -> {end_lat},{end_lng}")
+            logger.debug("Directions cache hit")
             return self._directions_cache[cache_key]
         
         self._cache_stats["directions_misses"] += 1
-        logger.info(f"Directions cache MISS for route {start_lat},{start_lng} -> {end_lat},{end_lng}")
+        logger.debug("Directions cache miss")
         
         try:
             url = f"{self.BASE_URL}/directions/json"
@@ -179,9 +202,7 @@ class GoogleMapsService:
                 wp_str = "|".join([f"{lat},{lng}" for lat, lng in waypoints])
                 params["waypoints"] = wp_str
 
-            response = await self.client.get(url, params=params)
-            response.raise_for_status()
-            result = response.json()
+            result = await self._request(url, params)
             
             if result.get("status") == "OK":
                 self._directions_cache[cache_key] = result
@@ -189,10 +210,8 @@ class GoogleMapsService:
             return result
 
         except httpx.HTTPError as e:
-            logger.error(f"HTTP error calling Google Directions API: {e}")
             raise
         except Exception as e:
-            logger.error(f"Error calling Google Directions API: {e}")
             raise
 
     async def geocode_address(self, address: str, country_code: Optional[str] = None) -> dict:
@@ -212,11 +231,11 @@ class GoogleMapsService:
         
         if cache_key in self._geocode_cache:
             self._cache_stats["geocode_hits"] += 1
-            logger.info(f"Geocode cache HIT for address: {address}")
+            logger.debug("Geocode cache hit")
             return self._geocode_cache[cache_key]
         
         self._cache_stats["geocode_misses"] += 1
-        logger.info(f"Geocode cache MISS for address: {address}")
+        logger.debug("Geocode cache miss")
         
         try:
             url = f"{self.BASE_URL}/geocode/json"
@@ -228,9 +247,7 @@ class GoogleMapsService:
             if country_code:
                 params["components"] = f"country:{country_code.upper()}"
 
-            response = await self.client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
+            data = await self._request(url, params)
 
             if data.get("status") != "OK" or not data.get("results"):
                 error = (
@@ -239,7 +256,7 @@ class GoogleMapsService:
                 )
                 if data.get("error_message"):
                     error += f": {data['error_message']}"
-                logger.error(error)
+                logger.warning("Geocoding returned no usable result")
                 raise ValueError(error)
 
             result = data["results"][0]
@@ -258,7 +275,6 @@ class GoogleMapsService:
             return geocode_result
 
         except Exception as e:
-            logger.error(f"Error geocoding address '{address}': {e}")
             raise
 
     async def reverse_geocode(
@@ -282,9 +298,7 @@ class GoogleMapsService:
                 "key": self.api_key,
             }
 
-            response = await self.client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
+            data = await self._request(url, params)
 
             if data.get("status") != "OK" or not data.get("results"):
                 return f"{latitude}, {longitude}"
@@ -292,7 +306,7 @@ class GoogleMapsService:
             return data["results"][0].get("formatted_address", f"{latitude}, {longitude}")
 
         except Exception as e:
-            logger.error(f"Error reverse geocoding coordinates: {e}")
+            logger.warning("Reverse geocoding fallback (%s)", type(e).__name__)
             return f"{latitude}, {longitude}"
         """
         Get distance matrix between multiple origins and destinations.
@@ -323,15 +337,11 @@ class GoogleMapsService:
             if departure_time:
                 params["departure_time"] = departure_time
 
-            response = await self.client.get(url, params=params)
-            response.raise_for_status()
-            return response.json()
+            return await self._request(url, params)
 
         except httpx.HTTPError as e:
-            logger.error(f"HTTP error calling Distance Matrix API: {e}")
             raise
         except Exception as e:
-            logger.error(f"Error calling Distance Matrix API: {e}")
             raise
 
     async def close(self):

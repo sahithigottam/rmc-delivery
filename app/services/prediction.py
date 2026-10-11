@@ -86,7 +86,7 @@ class PredictionService:
 
         # ── Step 1: Google Directions ─────────────────────────────────
         # Single API call: geocodes addresses + returns live-traffic ETA + polyline
-        logger.info(f"Prediction request: {start_address[:40]} → {end_address[:40]}")
+        logger.debug("Prediction requested")
         try:
             # Geocode both addresses first
             start_geo = await self._gmaps.geocode_address(start_address, country_code=country_code)
@@ -102,7 +102,7 @@ class PredictionService:
                 alternatives=False,
             )
         except Exception as e:
-            logger.error(f"Google Directions failed: {e}")
+            logger.error("Prediction dependency failed (%s)", type(e).__name__)
             return {"error": f"Google Directions API failed: {e}"}
 
         if not directions or directions.get("status") != "OK":
@@ -113,7 +113,7 @@ class PredictionService:
             )
             if directions and directions.get("error_message"):
                 error += f" {directions['error_message']}"
-            logger.error(error)
+            logger.error("Prediction Directions response unsuccessful")
             return {"error": error}
 
         route = directions["routes"][0]

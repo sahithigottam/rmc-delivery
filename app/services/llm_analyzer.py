@@ -101,7 +101,7 @@ class LLMAnalyzer:
                 self.available_model = None
                 return False
         except Exception as e:
-            logger.warning(f"LLMAnalyzer: Ollama unreachable ({e}). Template fallback active.")
+            logger.warning("LLMAnalyzer: Ollama unreachable (%s). Template fallback active.", type(e).__name__)
             self.available_model = None
             return False
 
@@ -253,7 +253,7 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
                         return {"source": f"llm:{self.available_model}", **parsed}
                     logger.warning(f"LLMAnalyzer: attempt {attempt+1} no usable JSON")
                 except Exception as e:
-                    logger.warning(f"LLMAnalyzer: attempt {attempt+1} failed: {e}")
+                    logger.warning("LLMAnalyzer: attempt %s failed (%s)", attempt + 1, type(e).__name__)
 
             logger.info("LLMAnalyzer: falling back to template")
 
@@ -332,7 +332,7 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
                     return {"source": f"llm:{self.available_model}", **parsed}
                 logger.warning("LLMAnalyzer compare: attempt %d no usable JSON", attempt + 1)
             except Exception as e:
-                logger.warning("LLMAnalyzer compare: attempt %d failed: %s", attempt + 1, e)
+                logger.warning("LLMAnalyzer compare: attempt %d failed (%s)", attempt + 1, type(e).__name__)
 
         logger.info("LLMAnalyzer compare: falling back to template")
         return self._template_comparison(plants_data)

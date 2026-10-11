@@ -68,7 +68,7 @@ async def start_trip(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        logger.error(f"Failed to start trip: {e}", exc_info=True)
+        logger.exception("Failed to start trip")
         raise HTTPException(status_code=500, detail="Failed to start trip")
 
 
