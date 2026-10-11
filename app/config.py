@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     gemini_api_key: str = ""
 
+    # Cloud Routing Service
+    routing_service_url: str = "https://rmc-routing-service-production.up.railway.app"
+
     # FastAPI
     log_level: str = "INFO"
     api_v1_prefix: str = "/api/v1"
