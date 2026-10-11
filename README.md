@@ -1,5 +1,14 @@
 # RMC Delivery Route Optimizer
 
+**New to setup? Follow the [start-to-finish setup guide](docs/SETUP_GUIDE.md).**
+It covers Clerk, backend configuration, first-business registration, plants,
+locations, saved job sites, and troubleshooting in order.
+
+Start with the [engineering handover](docs/HANDOVER.md) for the current product
+scope, business permissions, architecture, complete database dictionary,
+operating procedures, and known limitations. It supersedes older roadmap
+statements below when describing implemented functionality.
+
 A production-ready Python FastAPI backend for optimizing delivery routes for New Zealand RMC (Ready-Mix Concrete) trucks using real-time traffic data from Google Maps API.
 
 ## Features
@@ -92,6 +101,36 @@ docker-compose up --build
 The API will be available at http://localhost:8000
 
 ## API Endpoints
+
+### Structured catalogue
+
+Plants, brands, and regions are stored in SQLite. Startup imports
+`config/plants.json` once through a versioned catalogue migration, preserving
+existing plant IDs. Back up the SQLite file before the first rollout; editing
+the seed after import does not update the live catalogue.
+
+See [Catalogue API contract](docs/CATALOGUE_API.md) for the new `/api/v1`
+request/response shapes, pagination, version-checked PATCH, and idempotent POST.
+Shared company delivery destinations use the [job-site API](docs/JOB_SITES_API.md),
+not browser-only storage or the batching-plant catalogue.
+All API requests require a verified Clerk session; company operations also
+require an active organization.
+Configure `CLERK_JWKS_URL`, `CLERK_ISSUER`, `CLERK_AUTHORIZED_PARTIES`, and the
+server-only `SUPER_ADMIN_USER_ID` listing platform admins separated by semicolons.
+Only those verified users can manage business-owned brands and plants across
+companies. Register a business with its existing Clerk organization ID, then
+create its brands and plants. Plant ownership is inherited from its brand and
+cannot be shared or transferred to another business. Structured countries,
+states, cities, and city-linked regions are private to each business and support
+international operations. Platform-admin geography screens target the business
+opened in Businesses; dispatch and trips still use the active Clerk organization.
+Company roles `org:admin`, `org:plantadmin`, `org:driver`,
+and `org:member` share organization-scoped operational access for now.
+Company cross-organization write attempts return `403`; no company role
+grants platform-owner access. See
+[Authentication and organization access](docs/AUTHENTICATION.md). Back up and
+test the additive ownership migration on staging before applying it to the
+operational database.
 
 ### Health Check
 ```
@@ -243,4 +282,3 @@ For issues and questions, please open a GitHub issue or contact the development 
 - Production-ready folder structure
 - Docker support
 - Basic API documentation
-

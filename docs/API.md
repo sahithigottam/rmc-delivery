@@ -4,6 +4,10 @@
 > **Base URL:** `http://localhost:8000/api/v1`  
 > **Interactive Docs:** [Swagger UI](http://localhost:8000/docs) · [ReDoc](http://localhost:8000/redoc)
 
+Company-shared saved destinations are available under `/api/v1/job-sites`.
+See [job-site API](./JOB_SITES_API.md) for ownership, creation, editing,
+deactivation, and browser address-book migration.
+
 ---
 
 ## Table of Contents
@@ -54,6 +58,47 @@
 
 ## Overview
 
+### Timestamp contract
+
+Client-supplied `departure_datetime`, `scheduled_at`, `batch_time`, and GPS
+`captured_at` must include `Z` or an explicit timezone offset. Timezone-less
+timestamps are rejected with HTTP `422`; the backend does not infer the user's
+timezone from the brand, country, or server location. Optional batch/departure
+times can still be omitted to use the existing defaults.
+
+For example, `2026-10-11T10:00:00+05:30` is normalized to
+`2026-10-11T04:30:00Z`. SQLite stores UTC wall-time values, and the ORM restores
+their UTC timezone when reading them. Typed route, trip, event, vehicle, and
+dispatch responses serialize timestamps as timezone-qualified UTC. The UI should
+convert UTC to local time only for display.
+
+For a browser-local date/time input, convert the selected local instant before
+sending, e.g. `new Date(localDateTimeValue).toISOString()`. This uses the device's
+timezone; if scheduling for a different site timezone, convert using that
+explicit timezone instead. Never append `Z` to an unconverted local time.
+
+Existing SQLite timestamps are read as UTC without rewriting them. If older
+requests stored local wall time after losing their offset, the original instant
+cannot be inferred safely. Such records need review using independent evidence;
+this change does not guess offsets or bulk-repair historical data. The SQLite
+column representation is unchanged, so this type conversion does not require a
+SQLite schema migration.
+
+### Load-life and retarder fields
+
+`load_max_life_minutes` is the grade-adjusted **base** life, before retarder.
+When `retarder_added` is true, the effective limit is that base plus
+`retarder_extension_minutes`, applied once. For example, base 90 and extension 45
+give 135 minutes, not 180. `load_expiry_time`, live `load_minutes_remaining`, and
+monitoring all use the same reconstructed timer, including high-grade warning
+and critical thresholds.
+
+Older retarded trips may store the extended limit in the base-life column.
+When the persisted batch/expiry interval confirms this legacy representation,
+the backend reads it as base plus extension without rewriting the historical
+record. Legacy records with missing expiry evidence or incorrect historical
+timestamps still need manual assessment; the backend does not guess a repair.
+
 REST API for calculating optimized delivery routes for New Zealand RMC (Ready-Mix Concrete) trucks. Features include:
 
 - **Route calculation** with real-time traffic via Google Maps Directions API
@@ -62,6 +107,32 @@ REST API for calculating optimized delivery routes for New Zealand RMC (Ready-Mi
 - **Automatic rerouting** — background traffic monitor proactively reroutes active deliveries
 - **Real-time SSE stream** — push notifications for reroutes, traffic updates, and status changes
 - **Full audit trail** — every position update, traffic check, and reroute logged as an immutable event
+
+### Plant brand analysis
+
+See [Structured catalogue API](CATALOGUE_API.md) for the unpublished `/api/v1`
+catalogue replacement, migration, write restrictions, and UI integration changes.
+
+`POST /api/v1/plants/analyse` accepts a business-owned `brand_id` and
+`job_site_data.display_name`, the full destination address including its country.
+The optional `country_code` field accepts an uppercase ISO 3166-1 alpha-2 code
+(`IN` for India, `NZ` for New Zealand) and restricts geocoding of both addresses
+to that country. When omitted, geocoding supports international addresses without
+a country restriction; existing address-only requests continue to work.
+Your UI can send `"country_code": "IN"` when analysing India plants.
+Geocoding and analysis caches distinguish country codes.
+Successful results contain ETAs, remaining concrete life, risk, probability, and
+a recommendation; `best_plant_id` identifies the highest remaining-life result.
+Set `include_llm_analysis` to `true` to request a comparison of successful results.
+
+If geocoding or routing fails, the affected result contains an explicit `error`
+instead of an empty, success-shaped prediction. Failed plants are ranked last
+and excluded from best-plant selection and LLM comparison. Failed analyses and
+unsuccessful Directions responses are not cached, so retrying can recover.
+
+**Calibration limitation:** India routes use live Google routing and local weather,
+but risk probabilities and delay adjustments still use the existing NZTA/NZS 3109
+baselines. They are planning estimates, not India-calibrated guarantees.
 
 ### Architecture
 
@@ -95,7 +166,37 @@ REST API for calculating optimized delivery routes for New Zealand RMC (Ready-Mi
 
 ## Authentication
 
-Currently no authentication required. Implement JWT/API key auth in production.
+Every `/api/v1` endpoint requires a Clerk session token:
+
+```http
+Authorization: Bearer <Clerk session token>
+```
+
+The API validates the token signature against the configured Clerk JWKS,
+requires the configured issuer and allowed frontend origin (`azp`), and scopes
+route/trip operations to the active organization. Only the verified user ID
+configured as `SUPER_ADMIN_USER_ID` is the platform owner and can edit the
+business-owned catalogue across companies.
+`org:admin` is a company role, never platform Super Admin. It shares company
+operational access with `org:plantadmin`, `org:driver`, and `org:member` for now.
+Company cross-organization write attempts return `403`.
+`GET /auth/me` returns verified identity and capabilities for UI navigation.
+
+Business registration uses `POST /businesses` with an existing Clerk organization
+ID and name; it does not provision or verify an organization in Clerk. A brand
+requires that business's `organization_id`. Plants inherit exclusive ownership
+from their brand. Company brand/plant reads are automatically tenant-scoped.
+Structured `/countries`, `/states`, and `/cities` provide cascading location
+selection; regions require `city_id` and derive country, state, and timezone.
+See [CATALOGUE_API.md](./CATALOGUE_API.md) for onboarding and legacy ownership rules.
+`/health` and `/` remain public.
+
+See [Authentication and organization access](./AUTHENTICATION.md) for server
+configuration, the free-tier role mapping, plant assignments, and rollout
+requirements.
+
+The trip DELETE endpoint archives eligible terminal trips and retains their
+rows and event history; it does not physically erase operational data.
 
 ---
 
@@ -321,7 +422,7 @@ Trips represent an **active delivery in progress**. A trip is created from a cal
           ┌──┴──┐    │  │  │  ┌───▼─────┐
           │paused│◄───┘  │  └─►│cancelled│
           └─────┘        │    └─────────┘
-                         │ complete (manual or auto < 200m)
+                         │ complete (manual or auto <= 100m)
                    ┌─────▼────┐
                    │ completed │
                    └──────────┘
@@ -446,7 +547,8 @@ Report the truck's current GPS position.
   "lat": -37.0500,
   "lng": 175.1200,
   "heading": 195.5,
-  "speed_kmh": 72.3
+  "speed_kmh": 72.3,
+  "captured_at": "2026-10-11T15:00:00+05:30"
 }
 ```
 
@@ -456,6 +558,7 @@ Report the truck's current GPS position.
 | `lng` | float | ✅ | Longitude (−180 to 180) |
 | `heading` | float | — | Bearing in degrees (0–360) |
 | `speed_kmh` | float | — | Current speed in km/h |
+| `captured_at` | ISO 8601 datetime | — | Original GPS capture time, including `Z` or a timezone offset |
 
 **Response `200 OK`** — Updated `TripResponse`
 
@@ -463,9 +566,31 @@ Report the truck's current GPS position.
 - Updates `current_lat`, `current_lng`, `heading`
 - Recalculates remaining distance (haversine)
 - Logs `position_update` event
-- **Auto-completes trip** if within 200m of destination
+- **Auto-completes trip** if within 100m of destination (inclusive)
 
-**Errors:** `400` Trip not in progress/paused state
+`captured_at` is normalized to UTC and stored in the `position_update` audit
+payload separately from `received_at` (server receipt time). `created_at` remains
+the audit creation time. Trip responses expose `current_position_at` in UTC;
+position SSE events include both `captured_at` and `received_at`. The UI should
+convert these UTC timestamps to local time for display.
+
+Send the original browser GPS timestamp, e.g.
+`new Date(position.timestamp).toISOString()`, not the time an offline queue is
+uploaded. Reports older than or equal to the latest accepted capture time are
+rejected before updating coordinates, heading, distance, or auto-completion.
+Rejected reports are recorded as `position_rejected` audit events. This ordering
+survives server restarts. Reports without `captured_at` use receipt time for
+backward compatibility; their original capture time cannot be recovered.
+Historical position events without capture times use their audit creation time.
+
+**Errors:** `400` Trip not in progress/paused state, stale/duplicate capture time,
+or capture time in the future; `422` Invalid or timezone-less `captured_at`.
+
+These timestamps preserve report ordering, not proof of a driver's location:
+client-supplied coordinates and timestamps are not independently authenticated.
+A website cannot reliably track after the browser is closed or the device
+suspends it. Drivers must keep tracking active; reliable background tracking
+requires a native mobile app with the necessary OS permissions.
 
 ---
 
@@ -503,6 +628,36 @@ Resume a paused trip. Background traffic monitoring resumes.
 ### POST `/trips/{trip_id}/complete`
 
 Manually mark a trip as completed.
+
+Completion is allowed beyond **100 metres** from the destination, but
+`completion_review_required` is `true` and `completion_review_reason` explains why.
+`completion_distance_meters` is the straight-line distance calculated from the
+latest stored truck coordinates, not the remaining route distance. At exactly
+100 metres, completion is not flagged. Missing truck coordinates also require
+review. The distance and review flag are persisted in the `trip_completed` audit
+event and included in trip responses and the completion SSE status event.
+Historical trips without this audit data return `null` for these fields.
+The review flag does not change the reported delivery `outcome`.
+
+Only in-progress or paused trips can be completed; pending, completed, and
+cancelled trips are rejected. The backend recomputes actual load status from the
+timer at completion rather than trusting the last traffic-projected status.
+When `success` is omitted, actual expiry yields `outcome: "failed"`; otherwise
+the existing default is `"succeeded"`. GPS automatic completion uses the same
+outcome calculation. This default is not independent proof of a successful pour;
+separating arrival from pour completion remains a planned workflow change.
+
+An operator can report `success: true` for an actually expired load only with
+non-blank `notes` explaining the override. Without a reason, the API returns
+`400` without completing the trip. With a reason, the reported outcome is saved,
+actual load status remains `expired`, and completion is flagged for review even
+when the truck is within 100 metres. Location and expiry review reasons are
+combined. The audit records `expiry_override`, `reported_success`,
+`actual_load_status`, the load-timer snapshot, and the operator notes.
+
+Trip start/begin rejects future batch times and already-expired loads with
+`400`, before changing trip state. A valid older batch starts with its actual
+load status, rather than always starting as fresh.
 
 **Response `200 OK`** — Updated `TripResponse` with `status: "completed"`  
 **Errors:** `400` Trip already completed/cancelled
@@ -759,7 +914,7 @@ An `asyncio` background task that runs for the lifetime of the application. Star
 | Reroute threshold (absolute) | **>5 min** | Reroute if absolute traffic delay exceeds 5 minutes |
 | Reroute cooldown | **180s** | No re-reroute within 3 minutes of last reroute |
 | Min distance for check | **1 km** | Skip check if truck is < 1 km from destination |
-| Auto-complete distance | **200m** | Auto-complete trip if within 200m of destination |
+| Auto-complete distance | **100m** | Auto-complete trip if within 100m of destination |
 | Max consecutive errors | **5** | Flag trip for manual review after 5 consecutive check failures |
 
 ### Behavior
@@ -829,6 +984,6 @@ Common error patterns:
 4.  POST /trips/{id}/position   → Report GPS every few seconds
     ↕ Background monitor checks traffic every 2 min
     ↕ If delay detected → auto-reroutes → pushes SSE "reroute" event
-5.  POST /trips/{id}/complete   → Mark delivered (or auto-complete at <200m)
+5.  POST /trips/{id}/complete   → Mark delivered (or auto-complete at <=100m)
 6.  GET  /trips/{id}/events     → Review full audit trail
 ```
