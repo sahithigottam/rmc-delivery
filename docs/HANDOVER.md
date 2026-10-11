@@ -79,7 +79,7 @@ provisioning API is implemented here.
 | GPS tracking | Position reports with capture/receipt times and ordering checks | Browser background tracking and GPS trust/freshness remain limitations |
 | Completion review | 100-metre location check, expiry checks, durable review reasons | No review-resolution dashboard/API |
 | Live events | Authenticated SSE stream and stored trip events | SSE subscribers and alerts are process-local |
-| Traffic monitoring | Periodic in-process traffic checks and reroute handling | Monitor reliability and concurrency gaps remain |
+| Traffic monitoring | Periodic traffic checks plus GPS-triggered off-route recalculation | Two fresh fixes >100m from route; process-local serialization requires one worker |
 | Auditing | Catalogue mutations and trip events include actor identity where available | Not a database-enforced immutable audit store |
 | Persistence | SQLite catalogue, routes, trips, events, migration ledger, idempotency records | Backup/restore and reviewed schema rollout are required |
 

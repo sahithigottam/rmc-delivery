@@ -567,6 +567,27 @@ Report the truck's current GPS position.
 - Recalculates remaining distance (haversine)
 - Logs `position_update` event
 - **Auto-completes trip** if within 100m of destination (inclusive)
+- For in-progress trips, checks GPS distance from the current route locally.
+  Two consecutive accepted fixes **more than 100m** from the same route,
+  both captured within the last **30 seconds**, trigger immediate route
+  recalculation from exact current coordinates, without a traffic-delay trigger.
+  An on-route fix or route change resets confirmation. Paused trips and stale
+  fixes do not trigger off-route recalculation.
+- Off-route attempts have a separate **30-second cooldown**, including failures,
+  persisted in `off_route_check` events. Traffic's 180-second cooldown, movement
+  skip and 1km guard do not block confirmed off-route recalculation. The existing
+  100m arrival/auto-completion rule still runs first.
+- Successful recalculation persists the new polyline/ETA and emits the existing
+  SSE `reroute` payload (including steps) for map and voice consumers. Failures
+  preserve the previous route and appear in `traffic_check` audits/logs.
+  Missing/invalid route geometry is reported as `off_route_unavailable`.
+
+Local checks do not call Google. Only confirmed off-route attempts call Directions,
+using the existing exact-coordinate cache rather than the coarse traffic cache.
+Detection uses the encoded route geometry, not road matching; parallel roads
+within 100m and simplified geometry/GPS inaccuracies can limit detection.
+The two-fix evidence survives restart via position audits; per-trip check
+serialization is process-local, so use one backend worker/instance.
 
 `captured_at` is normalized to UTC and stored in the `position_update` audit
 payload separately from `received_at` (server receipt time). `created_at` remains
@@ -910,9 +931,11 @@ An `asyncio` background task that runs for the lifetime of the application. Star
 |---------|-------|-------------|
 | Check interval | **120s** | Full cycle runs every 2 minutes |
 | Inter-trip delay | **2s** | Gap between individual trip checks (rate limiting) |
-| Reroute threshold (ratio) | **>15%** | Reroute if new duration exceeds original by 15%+ |
+| Reroute threshold (ratio) | **>15%** | New duration exceeds expected remaining time from previous ETA; original duration is fallback when ETA is absent |
 | Reroute threshold (absolute) | **>5 min** | Reroute if absolute traffic delay exceeds 5 minutes |
-| Reroute cooldown | **180s** | No re-reroute within 3 minutes of last reroute |
+| Traffic reroute cooldown | **180s** | Traffic-triggered reroutes wait 3 minutes after the last applied reroute |
+| Off-route threshold | **>100m, two fixes** | Local geometry checks on fresh GPS updates |
+| Off-route freshness / attempt cooldown | **30s / 30s** | Both fixes must be recent; failed attempts also consume cooldown |
 | Min distance for check | **1 km** | Skip check if truck is < 1 km from destination |
 | Auto-complete distance | **100m** | Auto-complete trip if within 100m of destination |
 | Max consecutive errors | **5** | Flag trip for manual review after 5 consecutive check failures |

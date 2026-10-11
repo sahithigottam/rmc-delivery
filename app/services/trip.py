@@ -9,16 +9,19 @@ Architecture:
   4. Reroute engine:   compares new route vs current remaining duration,
                        if >15% slower or >5 min extra delay → logs reroute_suggested event,
                        auto-applies the new polyline, pushes SSE to connected clients
+                       GPS updates also confirm off-route fixes and recalculate immediately
   5. Load management:  90-minute concrete load timer, status transitions,
                        retarder recommendations, expiry detection (RMC domain)
   6. Event log:        every state change, position update, traffic check, reroute
                        is stored as an immutable TripEvent for audit
 """
 import asyncio
+import hashlib
 import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Dict, List, Optional, Set
+from weakref import WeakValueDictionary
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -44,6 +47,7 @@ from app.schemas import (
 from app.services.google_maps import GoogleMapsService
 from app.services.route import RouteService
 from app.utils.time import as_utc
+from app.utils.polyline import distance_to_route_metres
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,10 @@ REROUTE_COOLDOWN_SECONDS = 180           # don't reroute more than once per 3 mi
 TRAFFIC_CHECK_MIN_MOVEMENT_KM = 0.2      # skip Directions call if truck moved < 200m since last check
 TRAFFIC_CHECK_MAX_SKIP_SECONDS = 480     # always call API after 8 min regardless of movement
 COMPLETION_RADIUS_METERS = 100.0
+OFF_ROUTE_DISTANCE_METERS = 100.0
+OFF_ROUTE_FIX_MAX_AGE_SECONDS = 30
+OFF_ROUTE_COOLDOWN_SECONDS = 30
+_reroute_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
 
 # ── Per-trip position tracking for API call deduplication ─────────────────
 # Maps trip_id → (lat, lng) at the time of the last successful Directions call.
@@ -279,6 +287,18 @@ class TripService:
         remaining_km = self._haversine(pos.lat, pos.lng, trip.end_lat, trip.end_lng)
         trip.remaining_distance_meters = remaining_km * 1000
 
+        route_key = None
+        off_route_metres = None
+        if trip.status == "in_progress" and trip.current_polyline:
+            try:
+                off_route_metres = distance_to_route_metres(pos.lat, pos.lng, trip.current_polyline)
+                route_key = hashlib.sha256(trip.current_polyline.encode()).hexdigest()
+            except ValueError as exc:
+                logger.warning("Trip %s off-route detection unavailable: %s", trip_id, exc)
+                self._log_event(trip_id, "off_route_unavailable", {"reason": str(exc)})
+        elif trip.status == "in_progress":
+            logger.warning("Trip %s off-route detection unavailable: no route polyline", trip_id)
+            self._log_event(trip_id, "off_route_unavailable", {"reason": "No route polyline"})
         self._log_event(trip.id, "position_update", {
             "lat": pos.lat,
             "lng": pos.lng,
@@ -287,6 +307,8 @@ class TripService:
             "remaining_km": round(remaining_km, 2),
             "captured_at": captured_at.isoformat(),
             "received_at": received_at.isoformat(),
+            "route_key": route_key,
+            "distance_from_route_meters": off_route_metres,
         }, lat=pos.lat, lng=pos.lng)
 
         if remaining_km * 1000 <= COMPLETION_RADIUS_METERS:
@@ -303,6 +325,9 @@ class TripService:
             "received_at": received_at.isoformat(),
         })
 
+        if trip.status == "in_progress" and off_route_metres is not None:
+            await self.check_and_reroute(trip_id, off_route=True)
+            self.db.refresh(trip)
         return self._to_response(trip)
 
     async def pause_trip(self, trip_id: int) -> TripResponse:
@@ -607,7 +632,48 @@ class TripService:
 
     # ── Reroute Engine ─────────────────────────────────────────────────
 
-    async def check_and_reroute(self, trip_id: int) -> Optional[TripRerouteInfo]:
+    async def check_and_reroute(
+        self, trip_id: int, *, off_route: bool = False,
+    ) -> Optional[TripRerouteInfo]:
+        lock = _reroute_locks.get(trip_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _reroute_locks[trip_id] = lock
+        async with lock:
+            return await self._check_and_reroute(trip_id, off_route=off_route)
+
+    def _confirmed_off_route(self, trip: Trip) -> bool:
+        if not trip.current_polyline:
+            return False
+        now = datetime.now(timezone.utc)
+        fixes = self.db.query(TripEvent).filter(
+            TripEvent.trip_id == trip.id, TripEvent.event_type == "position_update",
+        ).order_by(TripEvent.id.desc()).limit(2).all()
+        if len(fixes) != 2:
+            return False
+        key = hashlib.sha256(trip.current_polyline.encode()).hexdigest()
+        for fix in fixes:
+            data = fix.data or {}
+            timestamp = data.get("captured_at")
+            distance = data.get("distance_from_route_meters")
+            if (not timestamp or data.get("route_key") != key or
+                    not isinstance(distance, (int, float)) or distance <= OFF_ROUTE_DISTANCE_METERS):
+                return False
+            age = (now - as_utc(datetime.fromisoformat(timestamp))).total_seconds()
+            if not 0 <= age <= OFF_ROUTE_FIX_MAX_AGE_SECONDS:
+                return False
+        if fixes[0].data["captured_at"] == fixes[1].data["captured_at"]:
+            return False
+        attempt = self.db.query(TripEvent).filter(
+            TripEvent.trip_id == trip.id, TripEvent.event_type == "off_route_check",
+        ).order_by(TripEvent.id.desc()).first()
+        return attempt is None or (
+            now - as_utc(attempt.created_at)
+        ).total_seconds() >= OFF_ROUTE_COOLDOWN_SECONDS
+
+    async def _check_and_reroute(
+        self, trip_id: int, *, off_route: bool = False,
+    ) -> Optional[TripRerouteInfo]:
         """
         Core reroute logic — called by the background monitor.
         1. Get trip's current position
@@ -616,33 +682,36 @@ class TripService:
         4. If significantly worse → apply reroute, log event, push SSE
         """
         trip = self._get_trip(trip_id)
+        self.db.refresh(trip)
 
-        if trip.status != "in_progress":
+        if trip.status != "in_progress" or trip.archived_at is not None:
+            return None
+        if off_route and not self._confirmed_off_route(trip):
             return None
 
         # Don't check if too close to destination
         remaining_km = self._haversine(
-            trip.current_lat or trip.start_lat,
-            trip.current_lng or trip.start_lng,
+            trip.current_lat if trip.current_lat is not None else trip.start_lat,
+            trip.current_lng if trip.current_lng is not None else trip.start_lng,
             trip.end_lat, trip.end_lng,
         )
-        if remaining_km < MIN_REMAINING_KM_FOR_CHECK:
+        if not off_route and remaining_km < MIN_REMAINING_KM_FOR_CHECK:
             return None
 
         # Cooldown check
-        if trip.last_reroute_at:
+        if not off_route and trip.last_reroute_at:
             elapsed = (datetime.now(timezone.utc) - as_utc(trip.last_reroute_at)).total_seconds()
             if elapsed < REROUTE_COOLDOWN_SECONDS:
                 return None
 
-        current_lat = trip.current_lat or trip.start_lat
-        current_lng = trip.current_lng or trip.start_lng
+        current_lat = trip.current_lat if trip.current_lat is not None else trip.start_lat
+        current_lng = trip.current_lng if trip.current_lng is not None else trip.start_lng
 
         # ── Skip Directions API call if truck hasn't moved meaningfully ──
         # This is the primary cost-saving guard: a stationary or slow-moving
         # truck generates the same ETA, so there's no point calling Google again.
         prev = _last_checked_positions.get(trip_id)
-        if prev and trip.last_traffic_check_at:
+        if not off_route and prev and trip.last_traffic_check_at:
             moved_km = self._haversine(prev[0], prev[1], current_lat, current_lng)
             time_since_s = (
                 datetime.now(timezone.utc)
@@ -662,6 +731,17 @@ class TripService:
             "low": "optimistic", "economy": "optimistic",
         }
         traffic_model = traffic_model_map.get(trip.priority or "normal", "best_guess")
+        position_time = self._latest_position_time(trip_id)
+        original_polyline = trip.current_polyline
+        expected_remaining = (
+            max(0, (as_utc(trip.estimated_arrival) - datetime.now(timezone.utc)).total_seconds())
+            if trip.estimated_arrival else trip.original_duration_seconds
+        )
+        if off_route:
+            self._log_event(trip_id, "off_route_check", {
+                "reason": "Two fresh GPS fixes more than 100 metres from route",
+            }, lat=current_lat, lng=current_lng)
+            self.db.commit()
 
         try:
             # Call Google Directions from current position.
@@ -676,8 +756,21 @@ class TripService:
                 traffic_model=traffic_model,
                 alternatives=False,
                 avoid=trip.avoid_options,
-                coarse_start=True,
+                coarse_start=not off_route,
             )
+            self.db.refresh(trip)
+            position_expired = off_route and (
+                position_time is None or
+                (datetime.now(timezone.utc) - position_time).total_seconds() > OFF_ROUTE_FIX_MAX_AGE_SECONDS
+            )
+            if (trip.status != "in_progress" or trip.archived_at is not None or
+                    trip.current_polyline != original_polyline or
+                    self._latest_position_time(trip_id) != position_time or position_expired):
+                self._log_event(trip_id, "traffic_check", {
+                    "status": "discarded", "reason": "Trip changed or GPS is no longer current during route calculation",
+                })
+                self.db.commit()
+                return None
 
             if directions.get("status") != "OK":
                 logger.warning(f"Traffic check failed for trip {trip_id}: {directions.get('status')}")
@@ -685,6 +778,7 @@ class TripService:
                     "status": "api_error",
                     "error": directions.get("error_message", "Unknown"),
                 }, lat=current_lat, lng=current_lng)
+                self.db.commit()
                 return None
 
             # Record position at time of this successful API call
@@ -698,6 +792,10 @@ class TripService:
             new_duration_traffic = leg.get("duration_in_traffic", {}).get("value")
             new_delay = (new_duration_traffic - new_duration) if new_duration_traffic else 0
             new_polyline = route_data.get("overview_polyline", {}).get("points")
+            if off_route:
+                if not new_polyline:
+                    raise ValueError("Off-route recalculation returned no route polyline")
+                distance_to_route_metres(current_lat, current_lng, new_polyline)
 
             # Update trip with latest traffic info
             trip.last_traffic_check_at = datetime.now(timezone.utc)
@@ -725,13 +823,13 @@ class TripService:
             await self._evaluate_load_status(trip, eta_minutes)
 
             # ── Reroute decision ──
-            old_remaining = trip.original_duration_seconds or new_duration
+            old_remaining = expected_remaining or new_duration
             effective_new = new_duration_traffic or new_duration
-            reroute_recommended = False
-            reason = ""
+            reroute_recommended = off_route
+            reason = "Driver is off the planned route" if off_route else ""
 
             # Check ratio
-            if old_remaining > 0:
+            if not off_route and old_remaining > 0:
                 ratio = effective_new / old_remaining
                 if ratio > REROUTE_RATIO_THRESHOLD:
                     reroute_recommended = True
@@ -739,7 +837,7 @@ class TripService:
                     reason = f"Route is {pct}% slower than expected"
 
             # Check absolute delay
-            if new_delay > REROUTE_DELAY_THRESHOLD_SECONDS:
+            if not off_route and new_delay > REROUTE_DELAY_THRESHOLD_SECONDS:
                 reroute_recommended = True
                 delay_min = int(new_delay / 60)
                 reason = f"Heavy traffic — {delay_min} min delay detected"
@@ -819,6 +917,7 @@ class TripService:
 
         except Exception as e:
             logger.error(f"Error checking traffic for trip {trip_id}: {e}")
+            self.db.rollback()
             self._log_event(trip_id, "traffic_check", {
                 "status": "error", "error": str(e),
             }, lat=current_lat, lng=current_lng)
