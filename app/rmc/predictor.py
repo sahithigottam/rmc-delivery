@@ -2,8 +2,8 @@
 DeliveryPredictor — Core RMC delivery prediction engine.
 
 Uses real NZTA Auckland traffic volume patterns as the baseline for
-hour-of-day and day-of-week congestion weights. When real trip data
-accumulates in the DB, those weights are updated automatically.
+hour-of-day and day-of-week congestion weights for NZ only. These are
+unvalidated application baselines; historical profiles must be supplied explicitly.
 
 Separation of concerns:
   - This module ONLY does maths and statistics.
@@ -86,16 +86,16 @@ class DeliveryPrediction:
     """Full output of the prediction engine."""
 
     # Core
-    success_probability: float        # 0.0 – 1.0
+    success_probability: Optional[float]  # unavailable without a country baseline
     confidence: str                   # "high" | "medium" | "low"
 
     # Duration estimates (minutes)
     google_eta_minutes: float
     adjusted_eta_minutes: float
-    p50_duration_minutes: float
-    p75_duration_minutes: float
-    p90_duration_minutes: float
-    p95_duration_minutes: float
+    p50_duration_minutes: Optional[float]
+    p75_duration_minutes: Optional[float]
+    p90_duration_minutes: Optional[float]
+    p95_duration_minutes: Optional[float]
 
     # Concrete window
     setting_time_minutes: float       # NZS 3109 limit (Weather Guard temp-adjusted)
@@ -116,7 +116,10 @@ class DeliveryPrediction:
     # Route context
     route_name: str = ""
     route_trips: int = 0
-    route_success_rate: float = 0.0
+    route_success_rate: Optional[float] = None
+    calibration_status: str = "nz_baseline"
+    baseline_source: str = "NZ application baseline (not validated)"
+    confidence_reason: str = "Application baseline estimate; not empirically validated."
 
     # Recommendation
     recommendation: str = ""
@@ -172,6 +175,7 @@ class DeliveryPredictor:
         weather: Optional[dict] = None,
         concrete_mix: str = "GP",
         route_profile: Optional[dict] = None,
+        country_code: str = "NZ",
     ) -> DeliveryPrediction:
         """
         Run the full prediction pipeline.
@@ -195,16 +199,21 @@ class DeliveryPredictor:
         concrete_mix_setting_min = MIX_LIMITS.get(concrete_mix.upper(), 90)
 
         # ── Use route profile if available, else global fallback ──────
+        if country_code not in ("IN", "NZ"):
+            raise ValueError("Prediction country must be IN or NZ")
+        use_nz_baseline = country_code == "NZ"
+        if not use_nz_baseline and route_profile is not None:
+            raise ValueError("India route profiles are not supported until country calibration is validated")
         profile = route_profile or self._global_fallback_profile()
         confidence = self._confidence_level(profile["total_trips"])
 
         # ── Step 1: Google error correction ──────────────────────────
         # How much does Google underestimate on this route historically?
-        google_error_correction = 1 + (profile["google_error_mean"] / 100)
+        google_error_correction = 1 + (profile["google_error_mean"] / 100) if use_nz_baseline else 1.0
 
         # ── Step 2: NZTA hour-of-day factor ──────────────────────────
         hour_stats = self.global_stats["hour_factors"].get(departure_hour, {})
-        hour_factor = 1 + (hour_stats.get("error_ratio", 8.0) / 100)
+        hour_factor = 1 + (hour_stats.get("error_ratio", 8.0) / 100) if use_nz_baseline else 1.0
 
         # Blend with route-specific hourly pattern if available
         route_hour_duration = profile.get("hourly_duration", {}).get(departure_hour)
@@ -225,9 +234,9 @@ class DeliveryPredictor:
 
         # ── Step 3: NZTA day-of-week factor ──────────────────────────
         day_stats = self.global_stats["day_factors"].get(departure_day, {})
-        day_factor = 1 + (day_stats.get("error_ratio", 9.0) / 100)
+        day_factor = 1 + (day_stats.get("error_ratio", 9.0) / 100) if use_nz_baseline else 1.0
 
-        friday_pm = departure_day == 4 and 14 <= departure_hour <= 17
+        friday_pm = use_nz_baseline and departure_day == 4 and 14 <= departure_hour <= 17
         if friday_pm:
             day_factor *= 1.10
             risk_factors.append({
@@ -258,7 +267,7 @@ class DeliveryPredictor:
                         "name": "Extreme heat — window at 60 min",
                         "impact": "critical",
                         "detail": (
-                            f"At {temp_c:.0f}°C, NZS 3109 hot weather limit applies (60 min, not 90)"
+                            f"At {temp_c:.0f}°C, application heat heuristic reduces the window to 60 min"
                         ),
                         "weight": 0.40,
                     })
@@ -268,7 +277,7 @@ class DeliveryPredictor:
                         "name": "High heat — Weather Guard shrinks window",
                         "impact": "high",
                         "detail": (
-                            f"At {temp_c:.0f}°C, effective NZS 3109 window is 75 min (not 90)"
+                            f"At {temp_c:.0f}°C, application heat heuristic reduces the window to 75 min"
                         ),
                         "weight": 0.30,
                     })
@@ -315,7 +324,7 @@ class DeliveryPredictor:
                 })
 
             # Forecast deterioration check
-            for hr in weather.get("forecast_hours", [])[1:]:
+            for hr in weather.get("forecast_hours", []):
                 if hr.get("speed_multiplier", 1.0) > weather_factor + 0.10:
                     risk_factors.append({
                         "name": "Weather deteriorating",
@@ -327,7 +336,7 @@ class DeliveryPredictor:
                     break
 
         # ── Step 5: Route reliability flags ──────────────────────────
-        if profile["success_rate"] < 0.80:
+        if use_nz_baseline and profile["success_rate"] < 0.80:
             risk_factors.append({
                 "name": f"Unreliable route history",
                 "impact": "high",
@@ -338,7 +347,7 @@ class DeliveryPredictor:
                 "weight": (1 - profile["success_rate"]) * 0.3,
             })
 
-        if profile.get("reroute_rate", 0) > 0.50:
+        if use_nz_baseline and profile.get("reroute_rate", 0) > 0.50:
             risk_factors.append({
                 "name": "High reroute probability",
                 "impact": "moderate",
@@ -356,30 +365,29 @@ class DeliveryPredictor:
         adjusted_eta *= (1 + excess * 0.5)
 
         # ── Step 7: Duration percentiles ─────────────────────────────
-        duration_ratio = google_eta_minutes / max(profile["avg_actual_duration_min"], 1)
-        p50 = profile["p50_duration_min"] * duration_ratio * weather_factor
-        p75 = profile["p75_duration_min"] * duration_ratio * weather_factor
-        p90 = profile["p90_duration_min"] * duration_ratio * weather_factor
-        p95 = profile["p95_duration_min"] * duration_ratio * weather_factor
+        p50 = p75 = p90 = p95 = blended_prob = None
+        if use_nz_baseline:
+            duration_ratio = google_eta_minutes / max(profile["avg_actual_duration_min"], 1)
+            p50 = profile["p50_duration_min"] * duration_ratio * weather_factor
+            p75 = profile["p75_duration_min"] * duration_ratio * weather_factor
+            p90 = profile["p90_duration_min"] * duration_ratio * weather_factor
+            p95 = profile["p95_duration_min"] * duration_ratio * weather_factor
 
-        # ── Step 8: Success probability ───────────────────────────────
-        duration_std = profile["std_actual_duration_min"] * duration_ratio * weather_factor
-        if duration_std > 0:
-            try:
-                from scipy import stats as scipy_stats
-                z_score = (concrete_setting_time - adjusted_eta) / duration_std
-                success_prob = float(scipy_stats.norm.cdf(z_score))
-            except ImportError:
-                # Fallback without scipy
+            # ── Step 8: Success probability ───────────────────────────────
+            duration_std = profile["std_actual_duration_min"] * duration_ratio * weather_factor
+            if duration_std > 0:
+                try:
+                    from scipy import stats as scipy_stats
+                    z_score = (concrete_setting_time - adjusted_eta) / duration_std
+                    success_prob = float(scipy_stats.norm.cdf(z_score))
+                except ImportError:
+                    success_prob = 1.0 if adjusted_eta < concrete_setting_time else 0.0
+            else:
                 success_prob = 1.0 if adjusted_eta < concrete_setting_time else 0.0
-        else:
-            success_prob = 1.0 if adjusted_eta < concrete_setting_time else 0.0
-
-        # Bayesian blend with route's historical rate
-        route_hour_success = profile.get("hourly_success", {}).get(
-            departure_hour, profile["success_rate"]
-        )
-        blended_prob = 0.60 * success_prob + 0.40 * route_hour_success
+            route_hour_success = profile.get("hourly_success", {}).get(
+                departure_hour, profile["success_rate"]
+            )
+            blended_prob = 0.60 * success_prob + 0.40 * route_hour_success
 
         # ── Step 9: Buffer Depletion + Risk Level ────────────────────
         # time_buffer: setting_time − travel (old metric, kept for backwards compat)
@@ -413,21 +421,37 @@ class DeliveryPredictor:
             risk_level = "low"
 
         # ── Step 10: Recommendation ───────────────────────────────────
-        recommendation, optimal_delay = self._generate_recommendation(
-            blended_prob, risk_level, time_buffer, buffer_ratio,
-            departure_hour, departure_day, risk_factors, concrete_setting_time,            remaining_life=remaining_life,        )
+        if blended_prob is not None:
+            recommendation, optimal_delay = self._generate_recommendation(
+                blended_prob, risk_level, time_buffer, buffer_ratio,
+                departure_hour, departure_day, risk_factors, concrete_setting_time,
+                remaining_life=remaining_life,
+            )
+        else:
+            advice = {
+                "low": "Within the configured time window; confirm site and mix conditions before dispatch.",
+                "moderate": "Proceed with monitoring; the remaining time margin is limited.",
+                "high": "Mitigate before dispatch: use a closer plant, review admixture options, or reschedule.",
+                "critical": "Do NOT dispatch under the current configured time window.",
+            }
+            recommendation = (
+                f"{advice[risk_level]} Remaining life estimate: {remaining_life:.0f} min. "
+                "Uncalibrated Google/weather estimate; mix windows and weather adjustments "
+                "are application heuristics, not verified concrete quality or success probability."
+            )
+            optimal_delay = 0
 
         risk_factors.sort(key=lambda r: r.get("weight", 0), reverse=True)
 
         return DeliveryPrediction(
-            success_probability=round(blended_prob, 3),
-            confidence=confidence,
+            success_probability=round(blended_prob, 3) if blended_prob is not None else None,
+            confidence=confidence if use_nz_baseline else "low",
             google_eta_minutes=round(google_eta_minutes, 1),
             adjusted_eta_minutes=round(adjusted_eta, 1),
-            p50_duration_minutes=round(p50, 1),
-            p75_duration_minutes=round(p75, 1),
-            p90_duration_minutes=round(p90, 1),
-            p95_duration_minutes=round(p95, 1),
+            p50_duration_minutes=round(p50, 1) if p50 is not None else None,
+            p75_duration_minutes=round(p75, 1) if p75 is not None else None,
+            p90_duration_minutes=round(p90, 1) if p90 is not None else None,
+            p95_duration_minutes=round(p95, 1) if p95 is not None else None,
             setting_time_minutes=round(concrete_setting_time, 1),
             time_buffer_minutes=round(time_buffer, 1),
             buffer_ratio=round(buffer_ratio, 3),
@@ -437,8 +461,15 @@ class DeliveryPredictor:
             risk_factors=risk_factors,
             risk_level=risk_level,
             route_name=profile.get("route_name", ""),
-            route_trips=profile["total_trips"],
-            route_success_rate=round(profile["success_rate"], 3),
+            route_trips=profile["total_trips"] if use_nz_baseline else 0,
+            route_success_rate=round(profile["success_rate"], 3) if use_nz_baseline else None,
+            calibration_status="nz_baseline" if use_nz_baseline else "uncalibrated",
+            baseline_source="NZ application baseline (not validated)" if use_nz_baseline else "Google ETA plus weather heuristics",
+            confidence_reason=(
+                "NZ application baseline/profile estimate; empirical calibration is not established."
+                if use_nz_baseline else
+                "No validated India traffic profile: probability and percentiles are unavailable."
+            ),
             recommendation=recommendation,
             optimal_dispatch_delay_minutes=optimal_delay,
             weather_condition=weather_condition,

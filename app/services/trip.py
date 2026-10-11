@@ -695,14 +695,13 @@ class TripService:
             trip.current_lng if trip.current_lng is not None else trip.start_lng,
             trip.end_lat, trip.end_lng,
         )
-        if not off_route and remaining_km < MIN_REMAINING_KM_FOR_CHECK:
-            return None
+        traffic_reroute_allowed = remaining_km >= MIN_REMAINING_KM_FOR_CHECK
 
-        # Cooldown check
+        # Reroute guards must not prevent ETA refreshes.
         if not off_route and trip.last_reroute_at:
             elapsed = (datetime.now(timezone.utc) - as_utc(trip.last_reroute_at)).total_seconds()
             if elapsed < REROUTE_COOLDOWN_SECONDS:
-                return None
+                traffic_reroute_allowed = False
 
         current_lat = trip.current_lat if trip.current_lat is not None else trip.start_lat
         current_lng = trip.current_lng if trip.current_lng is not None else trip.start_lng
@@ -829,7 +828,7 @@ class TripService:
             reason = "Driver is off the planned route" if off_route else ""
 
             # Check ratio
-            if not off_route and old_remaining > 0:
+            if not off_route and traffic_reroute_allowed and old_remaining > 0:
                 ratio = effective_new / old_remaining
                 if ratio > REROUTE_RATIO_THRESHOLD:
                     reroute_recommended = True
@@ -837,7 +836,7 @@ class TripService:
                     reason = f"Route is {pct}% slower than expected"
 
             # Check absolute delay
-            if not off_route and new_delay > REROUTE_DELAY_THRESHOLD_SECONDS:
+            if not off_route and traffic_reroute_allowed and new_delay > REROUTE_DELAY_THRESHOLD_SECONDS:
                 reroute_recommended = True
                 delay_min = int(new_delay / 60)
                 reason = f"Heavy traffic — {delay_min} min delay detected"

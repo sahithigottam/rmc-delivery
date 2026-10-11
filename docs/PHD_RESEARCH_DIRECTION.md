@@ -53,8 +53,15 @@ success.
 The predictor accepts a historical route profile, but the current plant-analysis
 flow does not supply one. It therefore uses a hard-coded fallback profile with
 zero observed trips. Collecting more trips does not currently cause automatic
-learning or recalibration. Auckland/NZ-oriented assumptions are not validated
-for Warangal or other Indian locations.
+learning or recalibration. NZ retains the existing application baseline, which
+is not empirically validated. India now excludes NZ traffic/history corrections
+and uses Google ETA plus weather heuristics, returning null probability and
+percentiles with an explicit uncalibrated explanation.
+
+Prediction hour/day factors use the selected plant's IANA timezone, or a supported
+country default for address-only predictions. Weather is requested and indexed
+in UTC, with timezone-qualified forecast timestamps. This fixes timezone
+alignment but does not validate the weather or concrete-window heuristics.
 
 ### LLM role
 
@@ -62,7 +69,8 @@ LLMs generate optional narratives, not the core ETA, remaining life, risk, or
 backend plant ranking. The plant-analysis endpoint ranks valid results by
 remaining life and optionally produces an overall comparison.
 
-Ollama is the default configured provider and expects a local service at port
+Uncalibrated results use explicit templates rather than an LLM, avoiding invented
+probabilities in explanations. Ollama is the default configured provider and expects a local service at port
 11434. That does not establish that Ollama is running on Render. Hosted Gemini
 or OpenRouter may be used if configured; otherwise templates provide fallback
 text.

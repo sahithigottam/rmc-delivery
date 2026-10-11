@@ -267,6 +267,10 @@ class GoogleMapsService:
                 "latitude": location["lat"],
                 "longitude": location["lng"],
                 "formatted_address": formatted_address,
+                "country_code": next((
+                    component.get("short_name") for component in result.get("address_components", [])
+                    if "country" in component.get("types", [])
+                ), None),
             }
             
             # Cache the result

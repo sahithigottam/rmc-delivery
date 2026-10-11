@@ -125,6 +125,28 @@ Successful results contain ETAs, remaining concrete life, risk, probability, and
 a recommendation; `best_plant_id` identifies the highest remaining-life result.
 Set `include_llm_analysis` to `true` to request a comparison of successful results.
 
+Country/timezone prediction policy:
+- NZ keeps the existing application traffic baseline; this is not empirically
+  validated. Hour/day factors use local plant time (including daylight saving),
+  not the server's UTC hour.
+- India uses Google ETA plus weather heuristics, without Auckland hour/day,
+  historical correction or distance-shortlist penalties. Successful India results
+  have `success_probability: null`; this is unavailable data, not a failed plant.
+  `baseline_source`, `confidence_reason`, and `prediction_calibration_status`
+  explain the policy. Brand analysis still ranks by remaining life.
+- Address-only `POST /api/v1/predict/delivery` and `/predict/best-plant` accept
+  optional `country_code` (`IN`/`NZ`); otherwise the destination's Google country
+  component is used. Unresolved/unsupported countries fail explicitly.
+  `/predict/best-plant` keeps NZ probability ranking and uses remaining-life
+  ranking for India. India duration percentiles are null as well.
+- Weather is requested/indexed in UTC and forecast timestamps include offsets.
+  `weather.available: false` identifies missing observations; neutral adjustment
+  factors do not imply that conditions are known or safe.
+- Uncalibrated narratives use templates, even when LLM analysis is requested.
+  Clients must render null probabilities/percentiles as unavailable, not 0%.
+  Mix windows, loading allowance and weather effects remain unvalidated
+  application heuristics, not proof of concrete quality or local regulatory compliance.
+
 If geocoding or routing fails, the affected result contains an explicit `error`
 instead of an empty, success-shaped prediction. Failed plants are ranked last
 and excluded from best-plant selection and LLM comparison. Failed analyses and
@@ -933,10 +955,10 @@ An `asyncio` background task that runs for the lifetime of the application. Star
 | Inter-trip delay | **2s** | Gap between individual trip checks (rate limiting) |
 | Reroute threshold (ratio) | **>15%** | New duration exceeds expected remaining time from previous ETA; original duration is fallback when ETA is absent |
 | Reroute threshold (absolute) | **>5 min** | Reroute if absolute traffic delay exceeds 5 minutes |
-| Traffic reroute cooldown | **180s** | Traffic-triggered reroutes wait 3 minutes after the last applied reroute |
+| Traffic reroute cooldown | **180s** | Traffic-triggered reroutes wait 3 minutes; ETA refresh is not blocked |
 | Off-route threshold | **>100m, two fixes** | Local geometry checks on fresh GPS updates |
 | Off-route freshness / attempt cooldown | **30s / 30s** | Both fixes must be recent; failed attempts also consume cooldown |
-| Min distance for check | **1 km** | Skip check if truck is < 1 km from destination |
+| Min distance for traffic reroute | **1 km** | Suppress traffic reroutes near destination; ETA checks still run |
 | Auto-complete distance | **100m** | Auto-complete trip if within 100m of destination |
 | Max consecutive errors | **5** | Flag trip for manual review after 5 consecutive check failures |
 

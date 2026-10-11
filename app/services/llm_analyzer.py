@@ -241,6 +241,9 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
             source, risk_summary, key_concern, recommendation,
             confidence, confidence_reason
         """
+        if pred.success_probability is None:
+            logger.info("Using explicit uncalibrated template; probability unavailable")
+            return {"source": "template", **self._template_analysis(pred)}
         await self._ensure_checked()
 
         if self.available_model:
@@ -264,6 +267,17 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
         Rule-based fallback. Returns identical JSON schema as LLM output.
         Active when Ollama is down or model is missing.
         """
+        if pred.success_probability is None:
+            return {
+                "risk_summary": (
+                    f"Uncalibrated {pred.risk_level} risk estimate; "
+                    f"{pred.remaining_life_minutes:.0f} min estimated remaining life."
+                ),
+                "key_concern": "No validated traffic profile or success probability.",
+                "recommendation": self._template_dispatch_advice(pred.risk_level),
+                "confidence": "LOW",
+                "confidence_reason": pred.confidence_reason,
+            }
         summaries = {
             "low":      (
                 f"Low risk — {pred.success_probability:.0%} success probability with "
@@ -287,11 +301,11 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
             "name": "General conditions", "detail": "No specific critical concerns."
         }
         conf_reason = (
-            f"Based on {pred.route_trips} historical trips — statistically reliable."
+            f"Profile based on {pred.route_trips} trips; empirical calibration is not established."
             if pred.route_trips >= 30
             else (
-                f"NZTA baseline used — {pred.route_trips} real trips logged so far. "
-                f"Accuracy improves with more data."
+                f"NZ application baseline used — {pred.route_trips} trips in this profile. "
+                f"Not empirically validated; automatic learning is not implemented."
             )
         )
         return {
@@ -312,6 +326,9 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
         Single LLM call that compares all plant prediction results
         and recommends the best plant/route for the dispatcher.
         """
+        if any(p.get("success_prob") is None for p in plants_data):
+            logger.info("Using uncalibrated plant comparison template")
+            return self._template_comparison(plants_data)
         await self._ensure_checked()
 
         if not self.available_model or not plants_data:
@@ -403,8 +420,10 @@ Reply with ONLY valid JSON — no extra text, no markdown, no code fences:
             "source": "template",
             "best_plant": best["plant_name"],
             "reason": (
-                f"Highest remaining concrete life ({best['remaining_life']:.0f} min) "
-                f"with {best['success_prob']:.0%} success probability."
+                f"Highest remaining concrete life ({best['remaining_life']:.0f} min). "
+                + (f"Estimated success probability: {best['success_prob']:.0%}."
+                   if best.get("success_prob") is not None else
+                   "Uncalibrated estimate; success probability is unavailable.")
             ),
             "risk_summary": f"Risk level: {best['risk_level']}.",
             "alternative": alt["plant_name"] if alt else "N/A",

@@ -524,6 +524,9 @@ class PlantPredictionResult(BaseModel):
     delay_constant_used: Optional[float] = None
     risk_level: Optional[str] = None          # low | medium | high | critical
     success_probability: Optional[float] = None
+    baseline_source: Optional[str] = None
+    confidence_reason: Optional[str] = None
+    prediction_calibration_status: Optional[str] = None
     recommendation: Optional[str] = None
     llm_analysis: Optional[dict] = None
     error: Optional[str] = None              # if this plant failed to resolve

@@ -191,6 +191,48 @@ async def test_traffic_ratio_uses_expected_remaining_not_original_full_duration(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["near_destination", "reroute_cooldown"])
+async def test_eta_refresh_not_blocked_by_traffic_reroute_guards(store, guard):
+    service, trip, maps, push = store
+    if guard == "near_destination":
+        trip.end_lng = 0.006
+    else:
+        trip.last_reroute_at = datetime.now(timezone.utc)
+    trip.estimated_arrival = datetime.now(timezone.utc) - timedelta(hours=1)
+    maps.get_directions.return_value["routes"][0]["legs"][0]["duration_in_traffic"]["value"] = 900
+    service.db.commit()
+    before = datetime.now(timezone.utc)
+    result = await service.check_and_reroute(trip.id)
+    maps.get_directions.assert_awaited_once()
+    assert result is None
+    service.db.refresh(trip)
+    from app.utils.time import as_utc
+    assert as_utc(trip.estimated_arrival) >= before + timedelta(seconds=900)
+    assert trip.remaining_duration_seconds == 900
+    assert trip.last_traffic_check_at is not None
+    assert trip.reroute_count == 0
+    event = next(call.args[2] for call in push.await_args_list if call.args[1] == "traffic_ok")
+    assert as_utc(datetime.fromisoformat(event["eta"])) == as_utc(trip.estimated_arrival)
+
+
+@pytest.mark.asyncio
+async def test_stationary_eta_refresh_preserves_eight_minute_api_cost_guard(store):
+    service, trip, maps, _ = store
+    trip.end_lng = 0.006
+    service.db.commit()
+    await service.check_and_reroute(trip.id)
+    await service.check_and_reroute(trip.id)
+    maps.get_directions.assert_awaited_once()
+    trip.last_traffic_check_at = datetime.now(timezone.utc) - timedelta(seconds=481)
+    trip.estimated_arrival = datetime.now(timezone.utc) - timedelta(minutes=1)
+    service.db.commit()
+    await service.check_and_reroute(trip.id)
+    assert maps.get_directions.await_count == 2
+    from app.utils.time import as_utc
+    assert as_utc(trip.estimated_arrival) > datetime.now(timezone.utc)
+
+
+@pytest.mark.asyncio
 async def test_wrong_company_cannot_trigger_maps(store):
     service, trip, maps, _ = store
     service.organization_id = "org_B"

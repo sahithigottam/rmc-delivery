@@ -187,6 +187,7 @@ async def analyse_brand(
                 start_address=plant["address"], end_address=address,
                 concrete_mix=req.concrete_mix, include_llm=False,
                 country_code=country,
+                local_timezone=plant["timezone"],
             )
             if result.get("error"):
                 logger.warning("Prediction failed for plant %s", plant["id"])
@@ -200,6 +201,9 @@ async def analyse_brand(
                 delay_constant_used=pred["delay_constant_used"],
                 risk_level=pred["risk_level"], success_probability=pred["success_probability"],
                 recommendation=result["recommendation"],
+                baseline_source=pred.get("baseline_source"),
+                confidence_reason=pred.get("confidence_reason"),
+                prediction_calibration_status=pred.get("calibration_status"),
             )
         except Exception as exc:
             logger.warning("Prediction failed for plant %s (%s)", plant["id"], type(exc).__name__)

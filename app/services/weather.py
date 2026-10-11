@@ -75,8 +75,8 @@ class WeatherService:
                 "latitude":            lat,
                 "longitude":           lng,
                 "hourly":              "temperature_2m,precipitation,windspeed_10m,windgusts_10m,weathercode",
-                "forecast_days":       1,
-                "timezone":            "Pacific/Auckland",
+                "forecast_days":       2,
+                "timezone":            "UTC",
                 "windspeed_unit":      "kmh",
             }
             resp = await self._client.get(self.BASE_URL, params=params, timeout=10.0)
@@ -86,10 +86,10 @@ class WeatherService:
             return self._parse_response(data, hours_ahead)
 
         except httpx.TimeoutException:
-            logger.warning("WeatherService: request timed out — using safe defaults")
+            logger.warning("WeatherService: timed out; weather adjustments disabled")
             return self._safe_default()
         except Exception as e:
-            logger.warning(f"WeatherService: fetch failed ({e}) — using safe defaults")
+            logger.warning("WeatherService: unavailable (%s); weather adjustments disabled", type(e).__name__)
             return self._safe_default()
 
     def _parse_response(self, data: dict, hours_ahead: int) -> dict:
@@ -101,15 +101,20 @@ class WeatherService:
         wind         = hourly.get("windspeed_10m", [])
         gusts        = hourly.get("windgusts_10m", [])
         codes        = hourly.get("weathercode", [])
+        if not times or any(len(values) != len(times) for values in (temps, precip, wind, gusts, codes)):
+            raise ValueError("Weather hourly arrays are missing or inconsistent")
 
-        # Find the current hour index
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:00")
-        try:
-            current_idx = next(
-                i for i, t in enumerate(times) if t.startswith(now_str[:13])
-            )
-        except StopIteration:
-            current_idx = 0
+        # The API is requested in UTC, including future hours across midnight.
+        now = datetime.now(timezone.utc)
+        parsed_times = [
+            datetime.fromisoformat(value).replace(tzinfo=timezone.utc) for value in times
+        ]
+        candidates = [i for i, value in enumerate(parsed_times) if value <= now]
+        if not candidates:
+            raise ValueError("Weather response does not cover the current UTC hour")
+        current_idx = candidates[-1]
+        if (now - parsed_times[current_idx]).total_seconds() >= 3600:
+            raise ValueError("Weather response has no current-hour observation")
 
         # Current conditions
         temp_c       = temps[current_idx]  if temps  else 20.0
@@ -168,13 +173,15 @@ class WeatherService:
                 else 1.00
             )
             forecast_hours.append({
-                "time":             times[i],
+                "time":             parsed_times[i].isoformat(),
                 "condition":        WMO_CONDITIONS.get(hr_code, "Unknown"),
                 "rain_mm":          hr_rain,
                 "speed_multiplier": hr_mult,
             })
 
         return {
+            "available": True,
+            "timezone": "UTC",
             "current": {
                 "condition":      condition,
                 "temperature_c":  temp_c,
@@ -194,8 +201,10 @@ class WeatherService:
 
     @staticmethod
     def _safe_default() -> dict:
-        """Conservative defaults used when the API is unreachable."""
+        """Explicitly unavailable weather with neutral adjustment factors."""
         return {
+            "available": False,
+            "timezone": "UTC",
             "current": {
                 "condition": "Unknown (API unavailable)",
                 "temperature_c": 20.0,

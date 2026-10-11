@@ -49,6 +49,7 @@ class DeliveryPredictionRequest(BaseModel):
         default=True,
         description="Include plain-English LLM risk narrative (requires Ollama). Set False for faster response.",
     )
+    country_code: Optional[str] = Field(None, pattern="^(IN|NZ)$")
 
 
 class BestPlantRequest(BaseModel):
@@ -80,6 +81,7 @@ class BestPlantRequest(BaseModel):
         le=10,
         description="Max candidate plants to query via Google Directions (default 5)",
     )
+    country_code: Optional[str] = Field(None, pattern="^(IN|NZ)$")
 
 
 class NearestPlantRequest(BaseModel):
@@ -128,9 +130,9 @@ class NearestPlantRequest(BaseModel):
 Provide a start address and end address. The system automatically:
 1. Calls Google Directions for live-traffic ETA
 2. Fetches current weather at the job site (Open-Meteo)
-3. Applies NZTA Auckland congestion calibration
-4. Computes NZS 3109 concrete window feasibility
-5. Asks the LLM (qwen2.5:3b) to explain the risk in plain English
+3. Applies existing NZ baseline corrections only for NZ, using local departure time
+4. Computes feasibility against configured mix/weather heuristics
+5. Produces an optional narrative; uncalibrated India results use explicit templates
 
 **Concrete mix limits (NZS 3109:1997):**
 - `GP` — General Purpose: 90 min normal, 60 min if temp > 30°C
@@ -160,6 +162,7 @@ async def predict_delivery(
             end_address=end_address,
             concrete_mix=req.concrete_mix,
             include_llm=req.include_llm_analysis,
+            country_code=req.country_code,
         )
         if "error" in result:
             raise HTTPException(status_code=400, detail=result["error"])
@@ -181,7 +184,8 @@ async def predict_delivery(
     description="""
 Automatically selects viable candidate plants from `config/plants.json` using
 free Haversine distance filtering, then scores them in parallel via Google
-Directions. Returns the plant with the highest delivery success probability.
+Directions. NZ retains probability ranking; India ranks by remaining life and
+returns null success probabilities rather than applying NZ statistics.
 
 **Two-stage approach:**
 1. **Haversine filter (free)** — eliminates plants physically too far away.
@@ -211,6 +215,7 @@ async def best_plant(
             job_site_address=job_site_address,
             concrete_mix=req.concrete_mix,
             top_n=req.top_n,
+            country_code=req.country_code,
         )
         if "error" in result:
             raise HTTPException(status_code=400, detail=result["error"])

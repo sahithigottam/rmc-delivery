@@ -6,7 +6,7 @@ It owns no logic — it just wires the four specialist components together:
 
   1. GoogleMapsService  → live ETA + coordinates from addresses
   2. WeatherService     → real-time weather at job site
-  3. DeliveryPredictor  → statistical risk scoring (NZTA-calibrated)
+  3. DeliveryPredictor  → NZ baseline or uncalibrated Google/weather scoring
   4. LLMAnalyzer        → plain English dispatcher narrative
 
 Usage (FastAPI endpoint):
@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
 
 from app.rmc.predictor import DeliveryPredictor, DeliveryPrediction
@@ -65,6 +66,7 @@ class PredictionService:
         concrete_mix: str = "GP",
         include_llm: bool = True,
         country_code: Optional[str] = None,
+        local_timezone: Optional[str] = None,
     ) -> dict:
         """
         Full pre-trip prediction pipeline.
@@ -81,8 +83,6 @@ class PredictionService:
             of whether LLM succeeded or fell back to template.
         """
         now           = datetime.now(timezone.utc)
-        departure_hour = now.hour
-        departure_day  = now.weekday()   # 0=Mon, 6=Sun
 
         # ── Step 1: Google Directions ─────────────────────────────────
         # Single API call: geocodes addresses + returns live-traffic ETA + polyline
@@ -91,6 +91,14 @@ class PredictionService:
             # Geocode both addresses first
             start_geo = await self._gmaps.geocode_address(start_address, country_code=country_code)
             end_geo   = await self._gmaps.geocode_address(end_address, country_code=country_code)
+            resolved_country = country_code or end_geo.get("country_code")
+            if resolved_country not in ("IN", "NZ"):
+                raise ValueError("Select country_code IN or NZ; destination country could not be resolved or is unsupported")
+            for geo in (start_geo, end_geo):
+                if geo.get("country_code") and geo["country_code"] != resolved_country:
+                    raise ValueError("Start and destination must belong to the selected country")
+            zone = local_timezone or {"IN": "Asia/Kolkata", "NZ": "Pacific/Auckland"}[resolved_country]
+            local_now = now.astimezone(ZoneInfo(zone))
 
             directions = await self._gmaps.get_directions(
                 start_lat=start_geo["latitude"],
@@ -149,10 +157,11 @@ class PredictionService:
             google_traffic_delay_s=traffic_delay_s,
             start_lat=start_lat, start_lng=start_lng,
             end_lat=end_lat,     end_lng=end_lng,
-            departure_hour=departure_hour,
-            departure_day=departure_day,
+            departure_hour=local_now.hour,
+            departure_day=local_now.weekday(),
             weather=weather,
             concrete_mix=concrete_mix,
+            country_code=resolved_country,
         )
 
         # ── Step 4: LLM narrative ─────────────────────────────────────
@@ -169,6 +178,9 @@ class PredictionService:
                 "start_address": resolved_start,
                 "end_address":   resolved_end,
                 "concrete_mix":  concrete_mix.upper(),
+                "country_code": resolved_country,
+                "timezone": zone,
+                "departure_local": local_now.isoformat(),
             },
             "traffic": {
                 "distance_km":            round(distance_m / 1000, 1),
@@ -177,7 +189,10 @@ class PredictionService:
                 "polyline":               polyline,
             },
             "prediction": {
-                "success_probability":    round(pred.success_probability, 3),
+                "success_probability":    pred.success_probability,
+                "calibration_status": pred.calibration_status,
+                "baseline_source": pred.baseline_source,
+                "confidence_reason": pred.confidence_reason,
                 "risk_level":             pred.risk_level.upper(),
                 "confidence":             pred.confidence.upper(),
                 "adjusted_eta_minutes":   round(pred.adjusted_eta_minutes, 1),
@@ -190,16 +205,18 @@ class PredictionService:
                 "buffer_depletion_rate":  round(pred.buffer_depletion_rate, 3),
                 "delay_constant_used":    pred.delay_constant_used,
                 "duration_percentiles": {
-                    "p50": round(pred.p50_duration_minutes, 1),
-                    "p75": round(pred.p75_duration_minutes, 1),
-                    "p90": round(pred.p90_duration_minutes, 1),
-                    "p95": round(pred.p95_duration_minutes, 1),
+                    "p50": pred.p50_duration_minutes,
+                    "p75": pred.p75_duration_minutes,
+                    "p90": pred.p90_duration_minutes,
+                    "p95": pred.p95_duration_minutes,
                 },
             },
             "weather": {
                 "condition":    pred.weather_condition,
                 "speed_impact": pred.weather_impact,
                 "current":      weather.get("current", {}),
+                "available": weather.get("available", True),
+                "timezone": weather.get("timezone", "UTC"),
             },
             "risk_factors":   pred.risk_factors,
             "recommendation": pred.recommendation,
@@ -211,6 +228,7 @@ class PredictionService:
         job_site_address: str,
         concrete_mix: str = "GP",
         top_n: int = 5,
+        country_code: Optional[str] = None,
     ) -> dict:
         """
         Find the best dispatching plant for a job site.
@@ -233,7 +251,7 @@ class PredictionService:
             {
               "best_plant": { id, name, brand, address, eta_minutes,
                               success_probability, risk_level, distance_km },
-              "all_plants": [ same shape, ranked by success_probability ]
+              "all_plants": [ same shape, NZ probability / India remaining-life ranking ]
             }
         """
         import asyncio
@@ -242,19 +260,27 @@ class PredictionService:
         # ── Stage 1: Free local pre-filter ────────────────────────────
         # Geocode job site once to get coordinates for Haversine
         try:
-            job_geo = await self._gmaps.geocode_address(job_site_address)
+            job_geo = await self._gmaps.geocode_address(job_site_address, country_code=country_code)
+            country = country_code or job_geo.get("country_code")
+            if country not in ("IN", "NZ"):
+                raise ValueError("Select country_code IN or NZ; destination country is unavailable or unsupported")
         except Exception as e:
             return {"error": f"Could not geocode job site: {e}"}
 
         concrete_limit = MIX_LIMITS.get(concrete_mix.upper(), 90)
         locator = self._locator
-        candidates = locator.candidates_for_job(
-            job_lat=job_geo["latitude"],
-            job_lng=job_geo["longitude"],
-            concrete_limit_minutes=concrete_limit,
-            top_n=top_n,
-            concrete_mix=concrete_mix,
-        )
+        if country == "NZ":
+            candidates = locator.candidates_for_job(
+                job_lat=job_geo["latitude"], job_lng=job_geo["longitude"],
+                concrete_limit_minutes=concrete_limit, top_n=len(locator.plants),
+                concrete_mix=concrete_mix,
+            )
+        else:
+            candidates = locator.nearest_by_distance(job_geo["latitude"], job_geo["longitude"])
+        candidates = [
+            plant for plant in candidates if plant["country_code"] == country
+            and concrete_mix in plant["supported_mix_codes"]
+        ][:top_n]
 
         if not candidates:
             return {"error": "No viable plants found within delivery window distance"}
@@ -271,6 +297,8 @@ class PredictionService:
                 end_address=job_site_address,
                 concrete_mix=concrete_mix,
                 include_llm=False,   # no LLM for comparison — speed matters here
+                country_code=plant["country_code"],
+                local_timezone=plant["timezone"],
             )
             if "error" in result:
                 logger.warning(f"best_plant: skipping {plant['name']} — {result['error']}")
@@ -286,6 +314,10 @@ class PredictionService:
                 "success_probability":  result["prediction"]["success_probability"],
                 "risk_level":           result["prediction"]["risk_level"],
                 "time_buffer_minutes":  result["prediction"]["time_buffer_minutes"],
+                "remaining_life_minutes": result["prediction"]["remaining_life_minutes"],
+                "calibration_status": result["prediction"]["calibration_status"],
+                "baseline_source": result["prediction"]["baseline_source"],
+                "confidence_reason": result["prediction"]["confidence_reason"],
             }
 
         results = await asyncio.gather(*[_score_plant(p) for p in candidates])
@@ -293,7 +325,10 @@ class PredictionService:
         if not valid:
             return {"error": "No plants returned valid Google Directions results"}
 
-        valid.sort(key=lambda r: r["success_probability"], reverse=True)
+        if country == "NZ":
+            valid.sort(key=lambda r: r["success_probability"], reverse=True)
+        else:
+            valid.sort(key=lambda r: r["remaining_life_minutes"], reverse=True)
         return {
             "job_site":   job_site_address,
             "concrete_mix": concrete_mix.upper(),

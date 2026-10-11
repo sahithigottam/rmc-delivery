@@ -112,6 +112,7 @@ def google_response(request):
             "results": [{
                 "geometry": {"location": {"lat": 17.98 + index * 0.01, "lng": 79.53}},
                 "formatted_address": address,
+                "address_components": [{"types": ["country"], "short_name": "IN"}],
             }],
         })
     start_lat = float(request.url.params["origin"].split(",")[0])
@@ -208,7 +209,10 @@ async def test_india_analysis_returns_complete_ranked_predictions(
         assert result["buffer_depletion_rate"] is not None
         assert result["delay_constant_used"] > 0
         assert result["risk_level"]
-        assert 0 <= result["success_probability"] <= 1
+        assert result["success_probability"] is None
+        assert result["baseline_source"] == "Google ETA plus weather heuristics"
+        assert "No validated India" in result["confidence_reason"]
+        assert result["adjusted_eta_minutes"] == expected_eta
         assert result["recommendation"]
     geocodes = [r for r in requests if r.url.path.endswith("/geocode/json")]
     assert all(
